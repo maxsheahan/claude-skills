@@ -5,7 +5,7 @@ Project instructions compiled for this repo (project: Second-Brain-OS). Global r
 This repo is public, so project rulings live in the gitignored `CLAUDE.local.md` beside this file.
 
 ## How changes land
-- Owner: max. Remote: `blueandyellow44/claude-skills`. Main branch: `main`.
+- Owner: max. Remote: `maxsheahan/claude-skills`. Main branch: `main`.
 - How changes land (`max-pr`): Branch and pull request for every change; merge to main only on Max's word. Never push to main (branch protection is on).
 - Deploy: none recorded in the ship registry.
 
