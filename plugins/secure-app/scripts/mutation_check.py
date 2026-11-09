@@ -54,7 +54,8 @@ def main() -> int:
             print(f"SETUP ERROR {label}: --find occurs {n} times in {a.file} at HEAD (must be exactly 1)")
             return 2
         open(target, "w", encoding="utf-8").write(text.replace(a.find, a.replace))
-        t = subprocess.run(a.test, shell=True, cwd=wt, capture_output=True, text=True)
+        # A shell on purpose: --test is the operator's own command line, typed by the person running this check.
+        t = subprocess.run(a.test, shell=True, cwd=wt, capture_output=True, text=True)  # nosemgrep: python.lang.security.audit.subprocess-shell-true.subprocess-shell-true
         if t.returncode != 0:
             print(f"DETECTED {label}: the tests failed with the protection removed")
             return 0

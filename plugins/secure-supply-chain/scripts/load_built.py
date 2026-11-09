@@ -9,10 +9,14 @@ and the new version's exports map hid a subpath Node needed.
 
 Two levels, both under Node itself, never vitest:
   1. built.resolve: every bare import and require in the built files (default
-     dist/, build/, out/ with .js/.mjs/.cjs) is resolved with Node's own
-     resolver from that file (import.meta.resolve for imports, require.resolve
-     for requires). Nothing is executed. Any ERR_PACKAGE_PATH_NOT_EXPORTED or
-     ERR_MODULE_NOT_FOUND FAILs.
+     dist/, build/, out/, lib/, .output/server/ (Nitro), .next/standalone/
+     (Next), with .js/.mjs/.cjs) is resolved with Node's own resolver from that
+     file (import.meta.resolve for imports, require.resolve for requires).
+     Nothing is executed. Any ERR_PACKAGE_PATH_NOT_EXPORTED or
+     ERR_MODULE_NOT_FOUND FAILs, and so does an import that resolves only
+     because a devDependency is installed (the owning package.json lists it in
+     devDependencies alone; production installs omit it). A template-literal
+     specifier with no substitution (import(`pkg`)) is a specifier.
   2. built.import: only for entries named with --entry or listed in
      security/load-check.json {"entries": [...]}: each is imported in a child
      Node with a 20 s timeout and an EMPTY environment (no secrets reach it).
@@ -28,7 +32,8 @@ original. A JSDoc example or a scaffolding template literal that contains an
 import line is text, not an import. Minified files are read too: a server
 bundle (esbuild --minify) is code Node runs; only a file that touches browser
 globals (window, document, navigator, webpack chunk loaders) and no Node-only
-API (process.env, __dirname, node: modules) is skipped as a browser bundle.
+API (process.env other than NODE_ENV, __dirname, node: modules) is skipped as a
+browser bundle.
 """
 import argparse
 import json
@@ -46,11 +51,15 @@ from ledger import result  # noqa: E402
 
 # Matched against text whose string bodies are blanked: the specifier is a run of spaces between
 # quotes here, read back from the comment-free original at the same span.
-IMPORT_RX = re.compile(r"""(?:^|[;\s}])(?:import\s+(?:[\w*{}\s,$]+\s+from\s+)?|export\s+[\w*{}\s,$]*\s+from\s+|import\()\s*(['"])([^'"]*)\1""", re.M)
-REQUIRE_RX = re.compile(r"""\brequire\(\s*(['"])([^'"]*)\1\s*\)""")
+IMPORT_RX = re.compile(r"""(?:^|[;\s}])(?:import\s+(?:[\w*{}\s,$]+\s+from\s+)?|export\s+[\w*{}\s,$]*\s+from\s+)\s*(['"])([^'"]*)\1""", re.M)
+# A call's specifier may also be a template literal with no substitution (import(`pkg`), require(`pkg`)).
+DYNAMIC_RX = re.compile(r"""(?:^|[;\s}(,=:!&|?])import\(\s*(['"`])([^'"`]*)\1""", re.M)
+REQUIRE_RX = re.compile(r"""\brequire\(\s*(['"`])([^'"`]*)\1\s*\)""")
 BUILTIN_PREFIX = ("node:", "cloudflare:", "bun:", "data:", "http:", "https:", "virtual:")
 BROWSER_RX = re.compile(r"\b(?:window|document|navigator)\s*[.\[]|webpackChunk|webpackJsonp|__next_f|\bself\.")
-NODE_RX = re.compile(r"process\.(?:env|argv|exit|cwd|stdout|stderr|platform)\b|__dirname|__filename|['\"]node:[a-z_/]+['\"]")
+# process.env.NODE_ENV is NOT Node-only: browser bundles keep it (React and most UMD builds branch on it).
+NODE_RX = re.compile(r"process\.(?:env(?!\.NODE_ENV\b)(?![\[]['\"]NODE_ENV)|argv|exit|cwd|stdout|stderr|platform)\b|__dirname|__filename|['\"]node:[a-z_/]+['\"]")
+DEFAULT_DIRS = ["dist", "build", "out", "lib", ".output/server", ".next/standalone"]  # Nitro and Next standalone server output too
 
 RESOLVER = r"""
 import {createRequire, builtinModules} from 'node:module';
@@ -104,9 +113,11 @@ def imports_of(path):
     kept = walk.strip_comments(raw, path, strings=True)
     blank = walk.strip_comments(raw, path, strings=False)
     out = []
-    for rx, kind in ((IMPORT_RX, "import"), (REQUIRE_RX, "require")):
+    for rx, kind in ((IMPORT_RX, "import"), (DYNAMIC_RX, "import"), (REQUIRE_RX, "require")):
         for m in rx.finditer(blank):
             s = kept[m.start(2):m.end(2)]
+            if "${" in s:  # a computed specifier: nothing static to resolve
+                continue
             if s and not s.startswith((".", "/")) and not s.startswith(BUILTIN_PREFIX):
                 out.append((s, kind))
     return out
@@ -122,7 +133,7 @@ def main():
     node = shutil.which("node")
     if not node:
         return ledger.emit([result("built.resolve", "Built code resolves under Node", "UNKNOWN", repo, reason="node not installed")])
-    dirs = a.dir or ["dist", "build", "out", "lib"]
+    dirs = a.dir or DEFAULT_DIRS
     files = built_files(repo, dirs)
     res = []
     if not files:
@@ -147,6 +158,9 @@ def main():
                               "%d built file(s), no bare imports left (bundled)" % len(files)))
         else:
             r = _resolve(node, uniq)
+            if r is not None:
+                failed = {(x["file"], x["spec"], x["kind"]) for x in r}
+                r += dev_only(repo, [it for it in uniq if (it["file"], it["spec"], it["kind"]) not in failed])
             if r is None:
                 res.append(result("built.resolve", "Built code resolves under Node", "UNKNOWN", "node resolver", reason="resolver did not run"))
             elif r:
@@ -183,6 +197,51 @@ def main():
             res.append(result(cid, "%s imports under Node" % e, "FAIL", "%s: %s" % (e, code.group(1) if code else "exit %d" % r.returncode),
                               severity="high", fix="fix the import or pin the dependency that broke it, then re-run under Node"))
     return ledger.emit(res)
+
+
+def _base(spec):
+    parts = spec.split("/")
+    return "/".join(parts[:2]) if spec.startswith("@") else parts[0]
+
+
+def owner_manifest(repo, path):
+    """The package.json that owns a built file: the nearest one above it, inside the repo, never in node_modules."""
+    d = os.path.dirname(os.path.abspath(path))
+    while True:
+        if "node_modules" not in d.split(os.sep):
+            pj = os.path.join(d, "package.json")
+            if os.path.isfile(pj):
+                return pj
+        if os.path.realpath(d) == os.path.realpath(repo) or os.path.dirname(d) == d:
+            return None
+        d = os.path.dirname(d)
+
+
+def dev_only(repo, items):
+    """Imports that resolve here only because devDependencies are installed. Production installs with
+    `npm ci --omit=dev` (or a pruned image), so a built file that imports a devDependency-only package
+    fails to load there even though it resolves on this machine."""
+    out, cache = [], {}
+    for it in items:
+        pj = owner_manifest(repo, it["file"])
+        if not pj:
+            continue
+        if pj not in cache:
+            try:
+                m = json.load(open(pj))
+            except (OSError, ValueError):
+                m = {}
+            prod = set()
+            for k in ("dependencies", "optionalDependencies", "peerDependencies", "bundleDependencies", "bundledDependencies"):
+                v = m.get(k) or {}
+                prod |= set(v if isinstance(v, (dict, list)) else [])
+            dev = set((m.get("devDependencies") or {}) if isinstance(m.get("devDependencies"), dict) else [])
+            cache[pj] = (prod, dev)
+        prod, dev = cache[pj]
+        b = _base(it["spec"])
+        if b in dev and b not in prod:
+            out.append(dict(it, code="DEV_DEPENDENCY_ONLY: absent after npm ci --omit=dev"))
+    return out
 
 
 def _resolve(node, items):

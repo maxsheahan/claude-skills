@@ -1,6 +1,6 @@
 {
   "name": "secure-core",
-  "version": "0.5.5",
+  "version": "0.6.1",
   "author": { "name": "Max Sheahan" },
   "description": "The secure-launch front door: maps a repo's attack surface (routes, auth, outbound fetches, paid APIs and their spend caps, secrets by name, data stores, deploy targets), runs every applicable check in the suite, and writes one findings ledger where each check is PASS, FAIL or UNKNOWN. Required by every other secure-launch plugin."
 }

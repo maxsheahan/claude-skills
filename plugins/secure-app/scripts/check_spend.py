@@ -10,8 +10,12 @@ forward traffic, and what stops them.
                         when unset (|| Infinity, ?? 1e9, "if (!cap) proceed",
                         a string default of "inf" or "Infinity" fed to float()
                         or Number(), or `isNaN(limit) || used < limit`, which
-                        lets an unparseable limit through) FAILs high. An unset
-                        cap must mean paused.
+                        lets an unparseable limit through) FAILs high. So does a
+                        cap binding that is unlimited on any branch (`cond ?
+                        Number(env.CAP) : Infinity`, `or math.inf`, a typed or
+                        pydantic field = math.inf) and `if (isNaN(limit))
+                        return true` in a "within" check. Text inside a string
+                        or docstring is prose. An unset cap must mean paused.
   spend.open-proxy      a route that takes request input and forwards it to a
                         third-party host with no bounds check in the handler
                         FAILs medium (a map app's /api/route and
@@ -29,7 +33,11 @@ forward traffic, and what stops them.
                         FAILs medium (a caller sets your bill). The request is
                         traced through the names it is bound to: `body`, a
                         destructuring, or a schema-parsed copy (`input =
-                        Schema.parse(await c.req.json())`, then `input.model`).
+                        Schema.parse(await c.req.json())`, then `input.model`),
+                        through Number()/parseInt() wrappers, and as Python
+                        kwargs (model=body['model']). A schema copy whose schema
+                        allow-lists or bounds the key (z.enum, .max(1024)) is
+                        the server's choice.
 """
 import os
 import re
@@ -51,6 +59,18 @@ UNLIMITED_DEFAULT = re.compile(
     r"""\b(?:float|int|Number|parseFloat|parseInt)\(\s*(?:os\.environ\.get|os\.getenv|getenv|environ\.get)\(\s*['"](?P<pyname>[^'"]+)['"]\s*(?:,|\)\s*or)\s*['"](?:inf|infinity|1e\d+|\d{9,})['"]"""
     r"""|\b(?:Number|parseFloat|parseInt|float)\(\s*(?:[\w$.]*env\.(?P<jsname>[\w$]+)|[\w$]+\.get\(\s*['"](?P<getname>[^'"]+)['"]\s*\))\s*(?:\?\?|\|\|)\s*['"](?:inf|infinity|1e\d+|\d{9,})['"]""", re.I)
 CAP_NAME = re.compile(r"cap|limit|budget|ceiling|max|quota|spend|cost|cutoff", re.I)
+# A value that means "no limit". Read in the strings-kept view at code positions only (float("inf") is a
+# call on a string; the same words inside a docstring or prompt are prose).
+UNLIMITED_TOKEN = (r"""Infinity\b|Number\.(?:POSITIVE_INFINITY|MAX_SAFE_INTEGER|MAX_VALUE)\b|\b1e\d{2,}\b|\b9{6,}\b"""
+                   r"""|\bfloat\(\s*['"](?:inf|infinity)['"]\s*\)|\b(?:math|np|numpy)\.inf\b|\bsys\.maxsize\b""")
+# A cap-named binding (JS const/let/var, a typed Python or pydantic field, a bare assignment) whose value can be
+# unlimited on some branch: `cond ? Number(env.CAP) : Infinity`, `float(env.get("CAP") or math.inf)`.
+UNLIMITED_BINDING = re.compile(
+    r"""(?m)(?:\b(?:const|let|var)\s+|^[ \t]*(?:self\.)?)(?P<name>[A-Za-z_$][\w$]*)\s*(?::\s*[^=\n]{1,60})?=(?!=)\s*(?P<rhs>[^\n;]{0,300}?(?:%s)[^\n;]{0,120})""" % UNLIMITED_TOKEN, re.I)
+# `if (Number.isNaN(limit)) return true` in a "within" check (the function then returns used < limit), or
+# `return next()`: an unparseable limit lets the call through.
+NAN_BRANCH = re.compile(
+    r"""if\s*\(\s*(?:(?:Number\.)?isNaN\(\s*(?P<cap>[\w$.]*(?:cap|limit|budget|ceiling|max|quota)[\w$]*)\s*\)|!\s*(?:Number\.)?isFinite\(\s*(?P<cap2>[\w$.]*(?:cap|limit|budget|ceiling|max|quota)[\w$]*)\s*\))\s*\)\s*\{?\s*return\s+(?P<ret>true\b|(?:await\s+)?next\(\s*\))""", re.I)
 # `Number.isNaN(limit) || used < limit`: an unset limit is NaN, the left side is true, and the call proceeds.
 # The same test in front of an "over" comparison (`isNaN(cap) || spent >= cap`) pauses, so only a
 # "within" comparison (the cap on the greater side) is the unlimited fallback.
@@ -58,7 +78,7 @@ NAN_PROCEEDS = re.compile(
     r"""(?:!\s*(?:Number\.)?isFinite|(?:Number\.)?isNaN)\(\s*(?P<cap>[\w$.]*(?:cap|limit|budget|ceiling|max|quota)[\w$]*)\s*\)\s*\|\|\s*"""
     r"""(?:[\w$.()\[\]]+\s*<=?\s*(?P=cap)\b|(?P=cap)\s*>=?\s*[\w$.()\[\]]+)""", re.I)
 UNLIMITED = re.compile(r"""(?:(?:cap|limit|budget|ceiling|max)\w*\s*(?:\)|\b)\s*(?:\|\||\?\?)\s*(?:Infinity|Number\.(?:MAX_SAFE_INTEGER|POSITIVE_INFINITY)|1e\d+|9{4,}))|if\s*\(\s*!\s*[\w.]*(?:cap|limit|budget|ceiling)\w*\s*\)\s*(?:return\s+(?:await\s+)?next\(\)|\{\s*//\s*no\s+cap)""", re.I)
-BOUNDS = re.compile(r"bounds|bbox|within|inBounds|isIn[A-Z]\w*|clamp|validate|schema|zod|\.parse\(|safeParse|MAX_|maxLength|\.slice\(0|allowlist|allowed|isFinite|Math\.(?:min|max)\(|> ?\d{2,}|< ?-?\d{2,}|too (?:far|long|many)", re.I)
+BOUNDS = re.compile(r"bounds|bbox|within|inBounds|isIn[A-Z]\w*|clamp|validate|schema|zod|\.parse\(|safeParse|MAX_|maxLength|\.slice\(0|allowlist|allowed|Math\.(?:min|max)\(|> ?\d{2,}|< ?-?\d{2,}|too (?:far|long|many)", re.I)
 # A limiter is code that refuses: a limiter object or binding, or a 429 the app itself RETURNS.
 # Reading an upstream's 429 (`if (r.status === 429)`) limits nothing.
 # A limiter is code that refuses: a limiter object used or built, a rate-limit binding, or a 429 the app
@@ -81,8 +101,19 @@ CLIENT_CODE = re.compile(r"(?:^|/)(?:components|hooks|public|client|frontend)/|\
 DESTRUCT = re.compile(r"""(?:const|let|var)\s*\{([^}]{1,300})\}\s*=\s*(?:await\s+)?([^;\n]{1,200})""")
 LLM_KEYS = re.compile(r"""\b(model|max_tokens|maxTokens|max_output_tokens|n)\s*(?::\s*([A-Za-z_$][\w$]*))?\s*[,}\n]""")
 
+# Request input: surface.CALLER_INPUT_RX (one vocabulary; the connecting-address headers the edge sets are not
+# caller input) and surface.request_names for the names it is bound to.
+REQ_ANY = surface.CALLER_INPUT_RX
+request_names = surface.request_names
+
+
 CALLER_CHOSEN_PREFIX = re.compile(r"(?:\bbody|\bpayload|\breqBody|\brequestBody|req\.body|\.data|\.(?:query|param|header)\(\s*['\"]?)\s*\.?\s*$")
 IP_KEY = re.compile(r"cf-connecting-ip|x-forwarded-for|x-real-ip|\bip\b|clientIp|remoteAddr", re.I)
+
+
+def _in_code(text, code, i):
+    """text[i] is code, not inside a string: the strings-blanked view still has the same character."""
+    return 0 <= i < len(code) and code[i] == text[i] and not text[i].isspace()
 
 
 def _caller_chosen(window, m, names):
@@ -96,32 +127,113 @@ def _caller_chosen(window, m, names):
     return bool(CALLER_CHOSEN_PREFIX.search(window[max(0, m.start() - 24):m.start()]))
 
 
+# Value-preserving wrappers between the key and the request value: Number(body.maxTokens) is still the caller's.
+WRAP = r"(?:(?:Number|parseInt|parseFloat|String|Math\.(?:floor|round|trunc|ceil|abs)|int|float|str)\(\s*)*"
+LLM_KEY = r"max_tokens|maxTokens|max_output_tokens|model|n"
+SCHEMA_BIND = re.compile(r"(?:const|let|var)\s+(?P<name>[A-Za-z_$][\w$]*|\{[^}]{1,300}\})\s*(?::[^=\n]{0,80})?=\s*(?:await\s+)?(?:(?P<schema>[A-Za-z_$][\w$]*)\s*\.\s*(?:parse|parseAsync|safeParse)\s*\(|(?P<valid>c\.req\.valid\s*\())")
+
+
+def _balanced_from(t, i, open_ch="(", close_ch=")"):
+    depth = 0
+    for j in range(i, min(len(t), i + 6000)):
+        depth += (t[j] == open_ch) - (t[j] == close_ch)
+        if depth == 0:
+            return t[i:j + 1]
+    return t[i:i + 6000]
+
+
+def _schema_text(t, name, at):
+    """The schema text a request copy `name` was validated against, or None when it is not a schema copy:
+    `const input = Req.parse(await c.req.json())` gives Req's definition; `c.req.valid('json')` gives the
+    nearest zValidator('json', ...) schema above it."""
+    for m in SCHEMA_BIND.finditer(t, 0, at):
+        bound = m.group("name")
+        names = {x.split(":")[-1].split("=")[0].strip() for x in bound.strip("{}").split(",")} if bound.startswith("{") else {bound}
+        if name not in names:
+            continue
+        if m.group("schema"):
+            d = re.search(r"(?:const|let|var)\s+%s\s*(?::[^=\n]{0,80})?=\s*" % re.escape(m.group("schema")), t)
+            return t[d.end():d.end() + 3000] if d else None
+        zv = [z for z in re.finditer(r"zValidator\s*\(\s*['\"]json['\"]\s*,\s*", t[:m.start()])]
+        if not zv:
+            return None
+        rest = t[zv[-1].end():]
+        if re.match(r"[A-Za-z_$][\w$]*\s*\)", rest):
+            d = re.search(r"(?:const|let|var)\s+%s\s*=\s*" % re.escape(re.match(r"[A-Za-z_$][\w$]*", rest).group(0)), t)
+            return t[d.end():d.end() + 3000] if d else None
+        return rest[:3000]
+    return None
+
+
+def _schema_clamps(schema, key):
+    """True when the schema fixes or bounds `key`: model as z.enum / z.literal (an allow-list), a number with
+    .max() / .lte() / a literal. A key the object schema does not declare is stripped by the parse."""
+    i = schema.find("{")
+    obj = _balanced_from(schema, i, "{", "}") if i >= 0 else schema
+    m = re.search(r"(?<![\w$])['\"]?%s['\"]?\s*:\s*" % re.escape(key), obj)
+    if not m:
+        return True
+    val = obj[m.end():m.end() + 300]
+    depth, end = 0, len(val)
+    for k, ch in enumerate(val):
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            if depth == 0:
+                end = k
+                break
+            depth -= 1
+        elif ch == "," and depth == 0:
+            end = k
+            break
+    val = val[:end]
+    if key == "model":
+        return bool(re.search(r"z\.(?:enum|literal|nativeEnum)\s*\(|\.refine\s*\(", val))
+    return bool(re.search(r"\.(?:max|lte|lt)\s*\(|z\.(?:literal|enum)\s*\(", val))
+
+
 def _llm_from_request(repo):
-    """`max_tokens: body.maxTokens`, `model: input.model` where input = Schema.parse(await c.req.json()):
-    a request value, under any name the file binds it to, reaching model, n or max_tokens."""
+    """`max_tokens: body.maxTokens`, `max_tokens: Number(body.maxTokens)`, `model: input.model` where input
+    is the request (c.req.json(), req.json(), c.req.valid('json'), a schema parse of either), Python
+    `model=body['model']`: a request value, under any name the file binds it to, reaching model, n or
+    max_tokens. A schema copy whose schema allow-lists or bounds that key (z.enum, .max(1024)) is the
+    server's choice, not the caller's."""
     out = []
     for p in walk.files(repo, tests=False, served=True):
         t = walk.read_code(p)
-        srcs = set(LLM_SOURCES) | surface.request_names(t)
-        rx = re.compile(r"""\b(?:max_tokens|maxTokens|max_output_tokens|model|n)\s*:\s*(?:%s)(?:\.data)?\.[\w$]+""" % "|".join(sorted(re.escape(x) for x in srcs)))
+        srcs = set(LLM_SOURCES) | request_names(t)
+        alt = "|".join(sorted(re.escape(x) for x in srcs))
+        if p.endswith(".py"):
+            rx = re.compile(r"""\b(?P<key>%s)\s*=\s*%s(?P<src>%s)(?:\[\s*['"](?P<f1>\w+)['"]\s*\]|\.get\(\s*['"](?P<f2>\w+)['"]|\.(?P<f3>\w+))""" % (LLM_KEY, WRAP, alt))
+        else:
+            rx = re.compile(r"""\b(?P<key>%s)\s*:\s*%s(?P<src>%s)(?:\.data)?(?:\??\.(?P<f3>[\w$]+)|\[\s*['"](?P<f1>[\w$]+)['"]\s*\])""" % (LLM_KEY, WRAP, alt))
         for m in rx.finditer(t):
+            field = m.group("f1") or m.group("f3") or (m.groupdict().get("f2") or "")
+            schema = _schema_text(t, m.group("src"), m.start())
+            if schema is not None and _schema_clamps(schema, field or m.group("key")):
+                continue
             out.append("%s:%d" % (walk.rel(repo, p), walk.line_of(t, m.start())))
     return out
 
 
 def _destructured_llm(repo):
-    """`const { model, max_tokens } = await c.req.json()` then `{ model, max_tokens: max_tokens }` in the provider call."""
+    """`const { model, max_tokens } = await req.json()` then `{ model, max_tokens: max_tokens }` in the provider call."""
     out = []
     for p in walk.files(repo, tests=False, served=True):
         t = walk.read_code(p)
         if not re.search(r"messages\.create|chat\.completions\.create|generateContent|max_tokens|maxTokens", t):
             continue
         names = set()
-        req_names = surface.request_names(t)
+        req_names = request_names(t)
         for m in DESTRUCT.finditer(t):
             src = m.group(2).strip()
-            if surface.REQ_INPUT_RX.search(src) or re.match(r"(?:body|payload|reqBody|requestBody)\b", src) or src.split(".")[0].rstrip(")") in req_names:
-                names |= {x.split(":")[-1].split("=")[0].strip() for x in m.group(1).split(",")}
+            if REQ_ANY.search(src) or re.match(r"(?:body|payload|reqBody|requestBody)\b", src) or src.split(".")[0].rstrip(")") in req_names:
+                bound = {x.split(":")[-1].split("=")[0].strip() for x in m.group(1).split(",")}
+                sm = re.match(r"([A-Za-z_$][\w$]*)\s*\.\s*(?:parse|parseAsync|safeParse)\s*\(", src)
+                if sm:
+                    schema = _schema_text(t, next(iter(bound)), m.end()) if bound else None
+                    bound = {b for b in bound if not (schema is not None and _schema_clamps(schema, b))}
+                names |= bound
         if not names:
             continue
         for call in re.finditer(r"(?:messages\.create|chat\.completions\.create|generateContent)\s*\(\s*\{([^}]{1,600})\}|body:\s*JSON\.stringify\(\s*\{([^}]{1,600})\}", t):
@@ -145,7 +257,7 @@ def _near_client_key(repo, rel, ln, span=12):
     is not a client key: a new id per request and the limit never fires (bench 2026-11-01)."""
     text = walk.read_code(os.path.join(repo, rel))
     lines = text.splitlines()
-    names = surface.request_names(text)
+    names = request_names(text)
     window = "\n".join(lines[max(0, ln - 1 - span): ln + span])
     if _client_keyed(window, names):
         return True
@@ -180,11 +292,16 @@ def _helper_forward(repo, h, own_hosts):
     open proxy split across two files (a map app's /api/reverse calling geo.ts). Followed one file over.
     Returns (hosts, helper body, 'file:function') or None."""
     text = walk.read_code(os.path.join(repo, h["file"]))
-    names = surface.import_names(repo, h["file"])
-    req_names = surface.request_names(text)
-    for m in re.finditer(r"\b([A-Za-z_$][\w$]*)\s*\(", h["code"]):
-        name = m.group(1)
-        if name not in names:
+    # relative, path-alias (@/lib/geo) and namespace (import * as geo; geo.reverseGeocode) imports
+    names = walk.import_bindings(repo, h["file"], text)
+    req_names = request_names(text)
+    for m in re.finditer(r"(?<![\w$.])(?:([A-Za-z_$][\w$]*)\s*\.\s*)?([A-Za-z_$][\w$]*)\s*\(", h["code"]):
+        ns, name = m.group(1), m.group(2)
+        if ns and names.get(ns, (None, None))[1] == "*":
+            target, orig = names[ns][0], name
+        elif not ns and name in names and names[name][1] != "*":
+            target, orig = names[name]
+        else:
             continue
         args = h["body"][m.end() - 1:]
         depth, k = 0, 0
@@ -193,10 +310,13 @@ def _helper_forward(repo, h, own_hosts):
             if depth == 0:
                 break
         args = args[:k + 1]
-        if not (surface.REQ_INPUT_RX.search(args) or any(re.search(r"\b%s\b" % re.escape(n), args) for n in req_names)):
+        if not (REQ_ANY.search(args) or any(re.search(r"\b%s\b" % re.escape(n), args) for n in req_names)):
             continue
-        target, orig = names[name]
-        body = walk.function_body(walk.read_code(os.path.join(repo, target)), orig)
+        ttext = walk.read_code(os.path.join(repo, target))
+        if orig == "default":
+            dm = re.search(r"export\s+default\s+(?:async\s+)?function\s*([A-Za-z_$][\w$]*)|export\s+default\s+([A-Za-z_$][\w$]*)", ttext)
+            orig = (dm.group(1) or dm.group(2)) if dm else orig
+        body = walk.function_body(ttext, orig)
         hosts = {hm.group(1) for hm in surface.URL_HOST_RX.finditer(body)} - own_hosts
         if hosts and re.search(r"\bfetch\(|axios|got\(", body):
             return hosts, body, "%s:%s" % (target, orig)
@@ -301,9 +421,28 @@ def main():
     unl += ["%s:%d (cap enforced only when set)" % (r, ln) for r, ln, _ in walk.find(repo, CAP_FALSY_SKIP, tests=False, served=True, strings=False)]
     unl += ["%s:%d (a cap set to unlimited)" % (r, ln) for r, ln, _ in walk.find(repo, UNLIMITED_VALUE, tests=False, served=True, strings=False)]
     unl += ["%s:%d (an unparseable cap passes the guard)" % (r, ln) for r, ln, _ in walk.find(repo, NAN_PROCEEDS, tests=False, served=True, strings=False)]
-    # strings kept here: the unlimited fallback IS a string ("inf") and the call around it is the code shape.
-    unl += ["%s:%d (default of \"inf\" when unset)" % (r, ln) for r, ln, m in walk.find(repo, UNLIMITED_DEFAULT, tests=False, served=True)
-            if CAP_NAME.search(m.group("pyname") or m.group("jsname") or m.group("getname") or "")]
+    # strings kept here: the unlimited fallback IS a string ("inf") and the call around it is the code shape;
+    # a match that starts inside a string (a docstring quoting the forbidden default) is prose.
+    for p in walk.files(repo, tests=False, served=True):
+        r = walk.rel(repo, p)
+        t, code = walk.read_code(p), walk.read_code(p, strings=False)
+        for m in UNLIMITED_DEFAULT.finditer(t):
+            if _in_code(t, code, m.start()) and CAP_NAME.search(m.group("pyname") or m.group("jsname") or m.group("getname") or ""):
+                unl.append("%s:%d (default of \"inf\" when unset)" % (r, walk.line_of(t, m.start())))
+        for m in UNLIMITED_BINDING.finditer(t):
+            tok = re.search(UNLIMITED_TOKEN, m.group("rhs"), re.I)
+            at = m.start("rhs") + tok.start()
+            if CAP_NAME.search(m.group("name")) and _in_code(t, code, m.start("name")) and _in_code(t, code, at):
+                unl.append("%s:%d (a cap that can be unlimited: %s)" % (r, walk.line_of(t, m.start()), tok.group(0)))
+        for m in NAN_BRANCH.finditer(code):
+            cap = m.group("cap") or m.group("cap2")
+            if m.group("ret").startswith("true"):
+                rest = code[m.end():m.end() + 600]
+                within = re.search(r"\breturn\s+[\w$.()\[\]]+\s*<=?\s*%s\b|\breturn\s+%s\s*>=?" % (re.escape(cap), re.escape(cap)), rest)
+                if not within:
+                    continue
+            unl.append("%s:%d (an unparseable cap lets the call through)" % (r, walk.line_of(code, m.start())))
+    unl = sorted(set(unl), key=unl.index)
     if unl:
         res.append(result("spend.unset-cap", "An unset cap means paused, not unlimited", "FAIL", ledger.join_hits(unl, 6, ", "), severity="high",
                           fix="treat a missing or unparseable cap as 0 (paused) and say so in the response"))
@@ -313,7 +452,7 @@ def main():
     hs = list(surface.handlers(repo))
     proxies, forwarders = [], []
     for h in hs:
-        if not surface.REQ_INPUT_RX.search(h["body"]):
+        if not surface.CALLER_INPUT_RX.search(h["body"]):
             continue
         hosts = {m.group(1) for m in surface.URL_HOST_RX.finditer(h["body"])} - own_hosts
         calls_out = hosts and re.search(r"\bfetch\(|axios|got\(", h["body"])

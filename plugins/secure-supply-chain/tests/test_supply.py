@@ -275,4 +275,109 @@ rc, c, out = T.run(os.path.join(S, "load_built.py"), tmpl_bad)
 T.status_is("phase 8: a real missing import next to a template literal still FAILs", c, "built.resolve", "FAIL", out)
 T.expect("phase 8: the FAIL names the real specifier, not the template text", "zod-missing" in c.get("built.resolve", {}).get("evidence", "") and "hono" not in c["built.resolve"]["evidence"], c.get("built.resolve", {}).get("evidence", ""))
 
+# ---- Phase 10 supply-core-gate ----
+# One FAIL and one PASS fixture per mechanism introduced in Phase 10 (the audit's fixtures become bench cases later).
+def _deps(files, *args):
+    r = T.tree(files)
+    if "audit.json" in files:
+        args = ("--audit-json", os.path.join(r, "audit.json")) + args
+    return T.run(os.path.join(S, "check_deps.py"), r, *args)
+
+
+_NPM_EMPTY = json.dumps({"vulnerabilities": {}})
+# workspace globs: `!` exclusions, `./` prefixes, flow-style pnpm lists
+rc, c, out = _deps({"package.json": json.dumps({"private": True, "workspaces": ["./apps/*", "!./apps/old"]}), "package-lock.json": "{}", "audit.json": _NPM_EMPTY,
+                    "apps/site/package.json": "{}", "apps/old/package.json": json.dumps({"dependencies": {"left-pad": "1.3.0"}})})
+T.status_is("phase 10: a folder excluded by `!./apps/old` is not a member, and has no lockfile", c, "deps.lockfile.apps_old", "FAIL", out)
+T.status_is("phase 10: ...while `./apps/*` still makes apps/site a member", c, "deps.lockfile.apps_site", "PASS", out)
+rc, c, out = _deps({"package.json": "{}", "pnpm-lock.yaml": "lockfileVersion: '9.0'\n", "pnpm-workspace.yaml": "packages: [\"services/*\"]  # flow style\n",
+                    "services/api/package.json": "{}", "tools/x/package.json": "{}", "audit.json": _NPM_EMPTY})
+T.status_is("phase 10: a flow-style pnpm-workspace.yaml list makes services/api a member", c, "deps.lockfile.services_api", "PASS", out)
+T.status_is("phase 10: ...and a folder outside it still needs its own lockfile", c, "deps.lockfile.tools_x", "FAIL", out)
+# yarn berry `yarn npm audit --json`
+_berry = json.dumps({"value": "tar-lite", "children": {"ID": 4242, "Issue": "Path traversal", "URL": "https://github.com/advisories/GHSA-tttt-aaaa-rrrr", "Severity": "critical", "Vulnerable Versions": "<2"}})
+rc, c, out = _deps({"package.json": "{}", "yarn.lock": "__metadata:\n  version: 8\n", "audit.json": _berry + "\n"})
+T.status_is("phase 10: a yarn berry audit line with a critical advisory FAILs", c, "deps.audit.root.tar-lite", "FAIL", out)
+rc, c, out = _deps({"package.json": "{}", "yarn.lock": "__metadata:\n  version: 8\n", "audit.json": _berry + "\n",
+                    "security/advisory-triage.json": json.dumps({"advisories": [{"package": "tar-lite", "advisory": "GHSA-tttt-aaaa-rrrr", "reachable": False, "reason": "never extracts uploads", "reviewed": "2026-11-01"}]})})
+T.status_is("phase 10: ...and PASSes once that advisory id is triaged unreachable", c, "deps.audit.root.tar-lite", "PASS", out)
+# every package folder gets a lockfile check; only audits are capped
+_many = {"package.json": "{}", "package-lock.json": "{}", "audit.json": _NPM_EMPTY}
+for _i in range(13):
+    _many["svc%02d/package.json" % _i] = "{}"
+    _many["svc%02d/package-lock.json" % _i] = "{}"
+_many["zz/package.json"] = "{}"
+rc, c, out = _deps(_many)
+T.status_is("phase 10: a 15th package folder with no lockfile is still checked", c, "deps.lockfile.zz", "FAIL", out)
+T.status_is("phase 10: ...an audit past the cap is UNKNOWN, never dropped", c, "deps.audit.svc12", "UNKNOWN", out)
+T.status_is("phase 10: ...and audits under the cap still run", c, "deps.audit.svc00.moderate", "PASS", out)
+
+
+def _pin(wf, extra=None):
+    files = {".github/workflows/w.yml": wf}
+    files.update(extra or {})
+    r = T.tree(files)
+    return T.run(os.path.join(S, "check_pinning.py"), r)
+
+
+_JOB = "on: [push]\njobs:\n  j:\n    runs-on: ubuntu-latest\n"
+# a `uses:` inside a block scalar is text
+rc, c, out = _pin(_JOB + "    steps:\n      - uses: actions/checkout@%s\n      - run: >-\n          echo 'uses: acme/x@v2'\n          > out.yml\n" % SHA1)
+T.status_is("phase 10: a `uses:` inside a folded run: block is text", c, "actions.pinned", "PASS", out)
+rc, c, out = _pin(_JOB + "    steps:\n      - run: |\n          echo hi\n      - uses: acme/x@v2\n" % ())
+T.status_is("phase 10: ...a real step right after a block scalar is still read", c, "actions.pinned", "FAIL", out)
+# docker:// actions are pinned only by digest
+rc, c, out = _pin(_JOB + "    steps:\n      - uses: docker://alpine:3.20\n")
+T.status_is("phase 10: docker://image:tag is a mutable image", c, "actions.pinned", "FAIL", out)
+rc, c, out = _pin(_JOB + "    steps:\n      - uses: docker://alpine@sha256:%s\n" % ("b" * 64))
+T.status_is("phase 10: docker://image@sha256:<digest> is pinned", c, "actions.pinned", "PASS", out)
+# job container env and secrets: inherit
+rc, c, out = _pin(_JOB + "    container:\n      image: node:22\n      env:\n        TOKEN: ${{secrets.TOKEN}}\n    steps:\n      - run: make\n")
+T.status_is("phase 10: a secret in jobs.<id>.container.env reaches every step", c, "actions.secret-scope", "FAIL", out)
+rc, c, out = _pin(_JOB + "    services:\n      db:\n        image: postgres:16\n        env:\n          POSTGRES_PASSWORD: ${{ secrets.PG }}\n    steps:\n      - run: make\n")
+T.status_is("phase 10: a secret in a service container's env reaches only that service", c, "actions.secret-scope", "PASS", out)
+rc, c, out = _pin("on: [push]\njobs:\n  call:\n    uses: acme/wf/.github/workflows/x.yml@%s\n    secrets: inherit\n" % SHA1)
+T.status_is("phase 10: `secrets: inherit` hands every secret to the called workflow", c, "actions.secret-scope", "FAIL", out)
+rc, c, out = _pin("on: [push]\njobs:\n  call:\n    uses: acme/wf/.github/workflows/x.yml@%s\n    secrets:\n      token: ${{ secrets.ONE }}\n" % SHA1)
+T.status_is("phase 10: ...passing one named secret to it is scoped", c, "actions.secret-scope", "PASS", out)
+# runner versions must be exact; more runner spellings
+for _cmd in ("npx --yes wrangler@~4.1.0 deploy", "npm exec --yes -- wrangler@next deploy", "npx --package=wrangler@4 wrangler deploy"):
+    rc, c, out = _pin(_JOB + "    steps:\n      - run: %s\n" % _cmd)
+    T.status_is("phase 10: `%s` is not an exact version" % _cmd, c, "tooling.wrangler", "FAIL", out)
+rc, c, out = _pin(_JOB + "    steps:\n      - run: npm x --yes wrangler@4.148.0 deploy\n      - run: npx --package=wrangler@4.148.0 wrangler d1 list\n")
+T.status_is("phase 10: npm x and npx --package= with an exact version PASS", c, "tooling.wrangler", "PASS", out)
+rc, c, out = _pin(_JOB + "    steps:\n      - run: pnpm dlx wrangler deploy\n", {"package.json": json.dumps({"devDependencies": {"wrangler": "4.148.0"}})})
+T.status_is("phase 10: pnpm dlx with no version downloads latest even when package.json pins wrangler", c, "tooling.wrangler", "FAIL", out)
+rc, c, out = _pin(_JOB + "    steps:\n      - run: npx wrangler deploy\n", {"package.json": json.dumps({"devDependencies": {"wrangler": "4.148.0"}})})
+T.status_is("phase 10: ...npx with no version uses the pinned local wrangler", c, "tooling.wrangler", "PASS", out)
+# wranglerVersion value and blank lines in a step
+rc, c, out = _pin(_JOB + "    steps:\n      - uses: cloudflare/wrangler-action@%s\n        with:\n          wranglerVersion: '4'\n" % SHA1)
+T.status_is("phase 10: wranglerVersion '4' is a range", c, "tooling.wrangler", "FAIL", out)
+rc, c, out = _pin(_JOB + "    steps:\n      - name: deploy\n\n        uses: cloudflare/wrangler-action@%s\n\n        with:\n          wranglerVersion: 4.148.0\n" % SHA1)
+T.status_is("phase 10: blank lines inside the action step do not hide its exact wranglerVersion", c, "tooling.wrangler", "PASS", out)
+
+# load_built: devDependency-only imports, template specifiers, NODE_ENV in browser bundles, server output dirs
+def _built(files):
+    return T.run(os.path.join(S, "load_built.py"), T.tree(files))
+
+
+_lib = {"node_modules/pino-lite/package.json": json.dumps({"name": "pino-lite", "version": "1.0.0", "main": "index.js"}), "node_modules/pino-lite/index.js": "module.exports = {}\n"}
+rc, c, out = _built(dict(_lib, **{"package.json": json.dumps({"name": "s", "devDependencies": {"pino-lite": "1.0.0"}}), "dist/main.js": "const p = require('pino-lite');\nmodule.exports = p;\n"}))
+T.status_is("phase 10: a built require of a devDependency-only package FAILs (absent after --omit=dev)", c, "built.resolve", "FAIL", out)
+rc, c, out = _built(dict(_lib, **{"package.json": json.dumps({"name": "s", "dependencies": {"pino-lite": "1.0.0"}, "devDependencies": {"pino-lite": "1.0.0"}}), "dist/main.js": "const p = require('pino-lite');\nmodule.exports = p;\n"}))
+T.status_is("phase 10: ...a package that is also a production dependency PASSes", c, "built.resolve", "PASS", out)
+rc, c, out = _built({"package.json": json.dumps({"name": "s"}), "dist/a.cjs": "module.exports = () => require(`gone-pkg`);\n"})
+T.status_is("phase 10: require(`pkg`) with a template-literal specifier is resolved", c, "built.resolve", "FAIL", out)
+rc, c, out = _built({"package.json": json.dumps({"name": "s"}), "dist/a.cjs": "module.exports = (n) => require(`./locales/${n}.js`);\n"})
+T.status_is("phase 10: ...a template with a substitution is computed, not a bare import", c, "built.resolve", "PASS", out)
+rc, c, out = _built({"package.json": json.dumps({"name": "s"}), "dist/x.min.js": "!function(){if(process.env.NODE_ENV!==\"production\")console.log(1);var d=document.body,r=require(\"preact\");d.append(r)}();\n", "dist/s.js": "module.exports = 1\n"})
+T.status_is("phase 10: a minified browser bundle that branches on process.env.NODE_ENV is still a browser bundle", c, "built.resolve", "PASS", out)
+rc, c, out = _built({"package.json": json.dumps({"name": "s"}), "dist/x.min.js": "var k=process.env.API_URL,d=typeof document;var r=require(\"gone-http\");module.exports=r;\n"})
+T.status_is("phase 10: ...a minified bundle reading another process.env value is Node code and is read", c, "built.resolve", "FAIL", out)
+rc, c, out = _built({"package.json": json.dumps({"name": "s"}), ".output/server/chunks/x.mjs": "export const a = 1\n", ".output/server/index.mjs": "import 'missing-h3';\n"})
+T.status_is("phase 10: Nitro's .output/server is built output", c, "built.resolve", "FAIL", out)
+rc, c, out = _built({"package.json": json.dumps({"name": "s"}), ".next/standalone/server.js": "const p = require('path');\nmodule.exports = p;\n"})
+T.status_is("phase 10: ...and so is .next/standalone (a builtin-only server PASSes)", c, "built.resolve", "PASS", out)
+# ---- end Phase 10 supply-core-gate ----
+
 T.finish()

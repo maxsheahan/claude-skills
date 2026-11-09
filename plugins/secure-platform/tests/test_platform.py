@@ -384,6 +384,12 @@ T.expect("fetch: the token value is in no output", FAKE_TOKEN not in snap_txt an
 T.expect("fetch: only GETs were issued", not any(s.startswith("POST") for s in CF.seen), str(CF.seen[:5]))
 rc, c, out = snap_run(json.loads(snap_txt))
 T.expect("fetch then judge: zone checks PASS and members is UNKNOWN", c.get("cfacct.ssl.zone1-example", {}).get("status") == "PASS" and c.get("cfacct.members-2fa", {}).get("status") == "UNKNOWN", {k: v["status"] for k, v in c.items()})
+# An API base that is not Cloudflare or a 127.0.0.1 test server never receives the token (Semgrep dynamic-urllib, secure-launch#1).
+for _bad in ("http://cloudflare.example.test/client/v4", "file:///etc/passwd", "http://localhost.evil.test:%d/client/v4" % cf.server_address[1]):
+    CF.seen.clear()
+    r = subprocess.run([sys.executable, ACCT, "fetch", "--out", os.path.join(outd, "bad.json")], capture_output=True, text=True,
+                       env=dict(fetch_env, CLOUDFLARE_API_BASE=_bad))
+    T.expect("fetch: refuses API base %s" % _bad, r.returncode != 0 and "refused" in (r.stdout + r.stderr) and not CF.seen, r.stdout[-300:] + r.stderr[-200:])
 cf.shutdown()
 
 # --- Phase 8: cloudflare / nextjs regressions ---
@@ -661,5 +667,189 @@ nx_srv = T.tree({"package.json": json.dumps({"dependencies": {"next": "16.2.0"}}
 rc, c, out = T.run(os.path.join(S, "check_nextjs.py"), nx_srv)
 T.status_is("P8 maps: a NEXT_PUBLIC_ server key still FAILs", c, "next.public-env-secrets", "FAIL", out)
 T.expect("P8 maps: MAPS_KEY in a server config is still a secret", __import__("importlib").import_module("check_cloudflare").secret_name("MAPS_KEY") is True)
+
+# ---- Phase 10 platform-b ----
+# One FAIL and one PASS fixture per mechanism added in Phase 10 (check_fly_supabase.py, check_railway.py).
+def _st(script, files, check):
+    rc, c, out = run(script, T.tree(files))
+    return c.get(check, {}).get("status"), out
+SB = {"supabase/config.toml": "project_id = \"p10\"\n"}
+# fly: comments are not configuration; every fly*.toml is an app config; a connection-string name with a variant word
+st, out = _st("check_fly_supabase.py", {"fly.toml": 'app = "a"\n[[services]]\n  [[services.ports]]\n    port = 7000\n    # handlers = ["http"]\n'}, "fly.exposure")
+T.expect("P10 fly: a commented-out handlers line is not a handler (FAIL)", st == "FAIL", out)
+st, out = _st("check_fly_supabase.py", {"fly.toml": 'app = "a"\n[[services]]\n  [[services.ports]]\n    handlers = ["http"]  # web\n    port = 80\n'}, "fly.exposure")
+T.expect("P10 fly: a trailing comment after a live handlers line is kept (PASS)", st == "PASS", out)
+st, out = _st("check_fly_supabase.py", {"fly.production.toml": 'app = "p"\n[env]\n  JWT_SECRET = "x"\n'}, "fly.env-secrets")
+T.expect("P10 fly: fly.production.toml is read (FAIL)", st == "FAIL", out)
+rc, c, out = run("check_fly_supabase.py", T.tree({"fly.toml": 'app = "a"\n[env]\n  PORT = "8080"\n', "fly.production.toml": 'app = "p"\n[env]\n  PORT = "8080"\n'}))
+T.expect("P10 fly: fly.toml and fly.production.toml in one folder get distinct ids", {"fly.env-secrets.root", "fly.env-secrets.root_production"} <= set(c), sorted(c))
+st, out = _st("check_fly_supabase.py", {"fly.toml": 'app = "a"\n[env]\n  POSTGRES_URL_NON_POOLING = "unset"\n'}, "fly.env-secrets")
+T.expect("P10 fly: POSTGRES_URL_NON_POOLING is a connection string (FAIL)", st == "FAIL", out)
+st, out = _st("check_fly_supabase.py", {"fly.toml": 'app = "a"\n[env]\n  DB_HOST_PRIMARY = "db.internal"\n  APP_URL_STAGING = "https://s.example.com"\n'}, "fly.env-secrets")
+T.expect("P10 fly: a host or a non-database URL with a variant word is not (PASS)", st == "PASS", out)
+# rls: identifier folding and TEMP tables; DROP / ALTER POLICY replay; casts and the role claim; ALTER VIEW option lists; drizzle out dir
+st, out = _st("check_fly_supabase.py", dict(SB, **{"supabase/migrations/1.sql": "CREATE TABLE Rooms (id int);\nALTER TABLE ROOMS ENABLE ROW LEVEL SECURITY;\nCREATE TEMPORARY TABLE staging_rows (id int);\n"}), "supabase.rls")
+T.expect("P10 rls: unquoted names fold to lowercase and a TEMPORARY table is not public (PASS)", st == "PASS", out)
+st, out = _st("check_fly_supabase.py", dict(SB, **{"supabase/migrations/1.sql": 'CREATE TABLE "Rooms" (id int);\nALTER TABLE rooms ENABLE ROW LEVEL SECURITY;\n'}), "supabase.rls")
+T.expect("P10 rls: a quoted mixed-case name stays distinct (FAIL)", st == "FAIL", out)
+POL = "create table public.items (id int, owner uuid);\nalter table public.items enable row level security;\ncreate policy writer on public.items for update using (true);\n"
+st, out = _st("check_fly_supabase.py", dict(SB, **{"supabase/migrations/1.sql": POL, "supabase/migrations/2.sql": "drop policy if exists writer on public.items;\n"}), "supabase.rls")
+T.expect("P10 rls: a later DROP POLICY removes the open policy (PASS)", st == "PASS", out)
+st, out = _st("check_fly_supabase.py", dict(SB, **{"supabase/migrations/1.sql": POL.replace("using (true)", "using (auth.uid() = owner)"), "supabase/migrations/2.sql": "alter policy writer on public.items with check (1 = 1);\n"}), "supabase.rls")
+T.expect("P10 rls: a later ALTER POLICY that opens the check FAILs", st == "FAIL", out)
+st, out = _st("check_fly_supabase.py", dict(SB, **{"supabase/migrations/1.sql": POL.replace("using (true)", "using ((auth.jwt() ->> 'role')::text = 'authenticated'::text)")}), "supabase.rls")
+T.expect("P10 rls: the JWT role claim with casts is any signed-in user (FAIL)", st == "FAIL", out)
+st, out = _st("check_fly_supabase.py", dict(SB, **{"supabase/migrations/1.sql": POL.replace("using (true)", "using ((auth.jwt() ->> 'sub')::uuid = owner)")}), "supabase.rls")
+T.expect("P10 rls: an owner-bound JWT claim with a cast PASSes", st == "PASS", out)
+VW = "create view public.board as select 1 as n;\n"
+st, out = _st("check_fly_supabase.py", dict(SB, **{"supabase/migrations/1.sql": VW + "alter view public.board set (check_option = local, security_invoker = on);\n"}), "supabase.rls")
+T.expect("P10 rls: security_invoker inside a multi-option SET counts (PASS)", st == "PASS", out)
+st, out = _st("check_fly_supabase.py", dict(SB, **{"supabase/migrations/1.sql": VW + "alter view public.board set (security_invoker = on, check_option = local);\nalter view public.board reset (security_invoker);\n"}), "supabase.rls")
+T.expect("P10 rls: a later RESET (security_invoker) turns it off (FAIL)", st == "FAIL", out)
+st, out = _st("check_fly_supabase.py", dict(SB, **{"drizzle.config.ts": "export default { out: './db/sql', dialect: 'postgresql' }\n", "db/sql/0000_x.sql": 'CREATE TABLE "items" ("id" int);\n'}), "supabase.rls")
+T.expect("P10 rls: SQL in the drizzle.config out folder is a migration (FAIL, not UNKNOWN)", st == "FAIL", out)
+st, out = _st("check_fly_supabase.py", dict(SB, **{"drizzle.config.ts": "export default { out: './db/sql', dialect: 'postgresql' }\n", "db/sql/0000_x.sql": 'CREATE TABLE "items" ("id" int);\nALTER TABLE "items" ENABLE ROW LEVEL SECURITY;\n'}), "supabase.rls")
+T.expect("P10 rls: ...and with RLS enabled there it PASSes", st == "PASS", out)
+# service-role: per-package Vite SPA roots, Vite server plugins, HTML pages, alias imports
+VP = json.dumps({"dependencies": {"vite": "6.0.0", "vue": "3.5.0"}})
+st, out = _st("check_fly_supabase.py", dict(SB, **{"package.json": json.dumps({"private": True}), "packages/admin/package.json": VP, "packages/admin/src/workers/x.ts": "const k = SUPABASE_SERVICE_ROLE_KEY\n"}), "supabase.service-role")
+T.expect("P10 service-role: a workspace Vite app's src/workers/ is its bundle (FAIL)", st == "FAIL", out)
+st, out = _st("check_fly_supabase.py", dict(SB, **{"package.json": json.dumps({"private": True}), "packages/admin/package.json": VP, "packages/admin/src/server/x.ts": "const k = process.env.SUPABASE_SERVICE_ROLE_KEY\n"}), "supabase.service-role")
+T.expect("P10 service-role: ...but its src/server/ is not (PASS)", st == "PASS", out)
+st, out = _st("check_fly_supabase.py", dict(SB, **{"package.json": json.dumps({"dependencies": {"vite": "6.0.0", "fastify": "5.0.0"}}), "src/db.ts": "const k = process.env.SUPABASE_SERVICE_ROLE_KEY\n"}), "supabase.service-role")
+T.expect("P10 service-role: Vite plus a server framework and no UI library is a server build (PASS)", st == "PASS", out)
+st, out = _st("check_fly_supabase.py", dict(SB, **{"templates/admin.html": "<script>const k = '{{ SUPABASE_SERVICE_ROLE_KEY }}'</script>\n"}), "supabase.service-role")
+T.expect("P10 service-role: an HTML page is browser code wherever it lives (FAIL)", st == "FAIL", out)
+st, out = _st("check_fly_supabase.py", dict(SB, **{"components/Admin.tsx": "import { k } from '~/server-lib/keys'\n", "server-lib/keys.ts": "export const k = process.env.SUPABASE_SERVICE_ROLE_KEY\n"}), "supabase.service-role")
+T.expect("P10 service-role: a ~/ alias import from browser code is followed (FAIL)", st == "FAIL", out)
+st, out = _st("check_fly_supabase.py", dict(SB, **{"components/Admin.tsx": "import { k } from '~/server-lib/flags'\n", "server-lib/flags.ts": "export const k = true\n", "server-lib/keys.ts": "export const k = process.env.SUPABASE_SERVICE_ROLE_KEY\n"}), "supabase.service-role")
+T.expect("P10 service-role: ...and a followed alias without the key PASSes", st == "PASS", out)
+# railway.env-dump: aliases of the whole env, response chains, body assignment, interpolation, .items()
+st, out = _st("check_railway.py", {"src/a.js": "const all = { ...process.env }\nlogger.warn('boot', all)\n"}, "railway.env-dump")
+T.expect("P10 railway: a name bound to the whole env is the env (FAIL)", st == "FAIL", out)
+st, out = _st("check_railway.py", {"src/a.js": "const mode = process.env.MODE\nlogger.warn('boot', mode)\n", "app.py": "from jinja2 import Environment\nenv = Environment()\nlogging.info('env %r', env)\n"}, "railway.env-dump")
+T.expect("P10 railway: a name bound to one variable, or to a Jinja Environment, is not (PASS)", st == "PASS", out)
+st, out = _st("check_railway.py", {"src/a.js": "app.get('/e', (q, r) => r.status(200).json(process.env))\nrouter.get('/b', (ctx) => { ctx.body = Bun.env })\n"}, "railway.env-dump")
+T.expect("P10 railway: a chained response and a Koa body assignment of the env FAIL", st == "FAIL" and "src/a.js:1" in out and "src/a.js:2" in out, out)
+st, out = _st("check_railway.py", {"src/a.js": "app.get('/e', (q, res) => res.status(200).json({ ok: Object.keys(process.env).length }))\nrouter.get('/b', (ctx) => { ctx.body = process.env.VERSION })\n"}, "railway.env-dump")
+T.expect("P10 railway: a chained response of a count and a body of one variable PASS", st == "PASS", out)
+st, out = _st("check_railway.py", {"app.py": "import os\nlogging.warning(f'cfg={dict(os.environ)}')\nprint(sorted(os.environ.values()))\n"}, "railway.env-dump")
+T.expect("P10 railway: an f-string interpolating the env and sorted(os.environ.values()) FAIL", st == "FAIL" and "app.py:2" in out and "app.py:3" in out, out)
+st, out = _st("check_railway.py", {"app.py": "import os\nlogging.warning(f'port={os.environ[\"PORT\"]}')\nprint(len(os.environ.items()))\n"}, "railway.env-dump")
+T.expect("P10 railway: an f-string of one variable and a count of items PASS", st == "PASS", out)
+# railway.config: command segments (cd, env prefixes), default start sources, dev-server vocabulary
+st, out = _st("check_railway.py", {"railway.json": json.dumps({"deploy": {"startCommand": "PORT=8080 cd web && yarn start"}}), "web/package.json": json.dumps({"scripts": {"start": "ng serve --host 0.0.0.0"}})}, "railway.config")
+T.expect("P10 railway: cd and an env prefix are followed into the package's start script (FAIL)", st == "FAIL", out)
+st, out = _st("check_railway.py", {"railway.json": json.dumps({"deploy": {"startCommand": "cd web && NODE_ENV=production yarn start"}}), "web/package.json": json.dumps({"scripts": {"start": "node --watch-path=./x dist/main.js"}})}, "railway.config")
+T.expect("P10 railway: ...and a production start script there PASSes (--watch-path is not --watch)", st == "PASS", out)
+st, out = _st("check_railway.py", {"railway.toml": '[build]\nbuilder = "DOCKERFILE"\ndockerfilePath = "ops/Dockerfile"\n', "ops/Dockerfile": "FROM python:3.12\nCMD python manage.py runserver 0.0.0.0:8000\n"}, "railway.config")
+T.expect("P10 railway: the CMD of the configured Dockerfile is the start command (FAIL)", st == "FAIL", out)
+st, out = _st("check_railway.py", {"railway.toml": '[build]\nbuilder = "DOCKERFILE"\ndockerfilePath = "ops/Dockerfile"\n', "ops/Dockerfile": "FROM python:3.12\nCMD [\"gunicorn\", \"app.wsgi\"]\n"}, "railway.config")
+T.expect("P10 railway: ...and a production CMD PASSes", st == "PASS", out)
+st, out = _st("check_railway.py", {"railway.json": "{}", "Procfile": "worker: node q.js\nweb: fastapi dev main.py\n"}, "railway.config")
+T.expect("P10 railway: the Procfile web process counts (FAIL)", st == "FAIL", out)
+st, out = _st("check_railway.py", {"railway.json": "{}", "nixpacks.toml": "[start]\ncmd = \"fastapi run main.py\"\n", "Procfile": "web: fastapi dev main.py\n"}, "railway.config")
+T.expect("P10 railway: nixpacks.toml [start] wins over the Procfile, and fastapi run is production (PASS)", st == "PASS", out)
+# ---- end Phase 10 platform-b ----
+
+# ---- Phase 10 platform-a ----
+# One FAIL and one PASS fixture per mechanism introduced in Phase 10 (check_cloudflare, check_nextjs,
+# check_gas, check_cloudflare_account). The audit's own fixtures become bench cases later.
+_W = 'name = "w"\nmain = "src/index.ts"\n'
+_IDX = "export default {}\n"
+_gk = T.fake_key("github", 31)
+
+
+def _pa(script, files, cid):
+    rc_, c_, out_ = run(script, T.tree(files))
+    return c_.get(cid, {}).get("status"), out_
+
+
+st, out = _pa("check_cloudflare.py", {"wrangler.toml": _W + 'vars.APP_ENV = "prod"\nvars.STRIPE_SECRET_KEY = "%s"\n' % _gk, "src/index.ts": _IDX}, "cf.vars-secrets")
+T.expect("P10 cf vars: a TOML dotted key vars.X is a var (FAIL)", st == "FAIL", out)
+st, out = _pa("check_cloudflare.py", {"wrangler.toml": _W + '[vars]\nAPP_ENV = "prod"\nSTRIPE_SECRET_KEY = ""\n', "src/index.ts": _IDX}, "cf.vars-secrets")
+T.expect("P10 cf vars: an empty TOML placeholder holds no value (PASS)", st == "PASS", out)
+st, out = _pa("check_cloudflare.py", {"wrangler.json": json.dumps({"name": "w", "main": "src/index.ts", "vars": {"openaiApiKey": _gk}}), "src/index.ts": _IDX}, "cf.vars-secrets")
+T.expect("P10 cf vars: a camelCase JSON var name reads as its SNAKE twin (FAIL)", st == "FAIL", out)
+_D1 = '[[d1_databases]]\nbinding = "DB"\ndatabase_id = "dev-1"\n[env.staging]\n[[env.staging.d1_databases]]\nbinding = "DB"\ndatabase_id = "%s"\n[env.production]\n[[env.production.d1_databases]]\nbinding = "DB"\ndatabase_id = "prod-1"\n'
+st, out = _pa("check_cloudflare.py", {"wrangler.toml": _W + _D1 % "prod-1", "src/index.ts": _IDX}, "cf.env-bindings")
+T.expect("P10 cf env: staging sharing [env.production]'s id FAILs though the top level is dev", st == "FAIL", out)
+st, out = _pa("check_cloudflare.py", {"wrangler.toml": _W + _D1 % "staging-1", "src/index.ts": _IDX}, "cf.env-bindings")
+T.expect("P10 cf env: ...its own id PASSes", st == "PASS", out)
+st, out = _pa("check_cloudflare.py", {"wrangler.json": json.dumps({"name": "w", "main": "src/index.ts", "hyperdrive": [{"binding": "PG", "id": "h-1"}], "env": {"staging": {"hyperdrive": [{"binding": "PG", "id": "h-1"}]}}}), "src/index.ts": _IDX}, "cf.env-bindings")
+T.expect("P10 cf env: a Hyperdrive id shared in wrangler.json FAILs", st == "FAIL", out)
+st, out = _pa("check_cloudflare.py", {"wrangler.toml": _W, "src/index.ts": "export default { fetch() { const r = new Response('ok'); r.headers.set('Strict-Transport-Security', 'max-age=0'); return r } }\n"}, "cf.headers.hsts")
+T.expect("P10 cf headers: a literal value set in code is judged (max-age=0 FAILs)", st == "FAIL" and "does not protect" in out, out)
+st, out = _pa("check_cloudflare.py", {"wrangler.toml": _W, "src/index.ts": "export default { fetch() { const r = new Response('ok'); r.headers.set('Strict-Transport-Security', 'max-age=31536000'); return r } }\n"}, "cf.headers.hsts")
+T.expect("P10 cf headers: ...a protective literal PASSes", st == "PASS", out)
+st, out = _pa("check_cloudflare.py", {"wrangler.toml": _W, "src/index.ts": "app.get('*', (c) => { console.log(c.req.header('X-Frame-Options')); return c.text('ok') })\n"}, "cf.headers.framing")
+T.expect("P10 cf headers: a one-argument header(name) reads a request header (FAIL)", st == "FAIL", out)
+st, out = _pa("check_cloudflare.py", {"wrangler.toml": _W, "src/index.ts": "const h = {}\nh['X-Frame-Options'] = 'DENY'\nconst H = new Headers([['Referrer-Policy', 'no-referrer']])\n"}, "cf.headers.framing")
+st2, out2 = _pa("check_cloudflare.py", {"wrangler.toml": _W, "src/index.ts": "const h = {}\nh['X-Frame-Options'] = 'DENY'\nconst H = new Headers([['Referrer-Policy', 'no-referrer']])\n"}, "cf.headers.referrer")
+T.expect("P10 cf headers: a subscript assignment and a [name, value] pair set a header (PASS)", st == "PASS" and st2 == "PASS", out + out2)
+st, out = _pa("check_cloudflare.py", {"wrangler.toml": _W, "src/index.ts": "export const WHY = { 'Referrer-Policy': 'limits referrer leaks' }\n"}, "cf.headers.referrer")
+T.expect("P10 cf headers: prose is not a Referrer-Policy value (FAIL)", st == "FAIL", out)
+_SH = "import { secureHeaders } from 'hono/secure-headers'\napp.use(%s, secureHeaders())\n"
+st, out = _pa("check_cloudflare.py", {"wrangler.toml": _W, "src/index.ts": _SH % "'/api/*'"}, "cf.headers.hsts")
+T.expect("P10 cf headers: secureHeaders() mounted on /api/* only does not cover the pages (FAIL)", st == "FAIL" and "mounted on /api/* only" in out, out)
+st, out = _pa("check_cloudflare.py", {"wrangler.toml": _W, "src/index.ts": _SH % "'*'"}, "cf.headers.hsts")
+T.expect("P10 cf headers: ...mounted on * it does (PASS)", st == "PASS", out)
+
+_NX = {"next.config.ts": "export default {}\n"}
+st, out = _pa("check_nextjs.py", dict(_NX, **{"app/a.ts": "'use server'\nasync function wipe(id: string) {\n  await db.delete(t).where(eq(t.id, id))\n}\nexport { wipe as remove }\n"}), "next.server-actions")
+T.expect("P10 next: a function exported through an export list is an action (FAIL)", st == "FAIL", out)
+st, out = _pa("check_nextjs.py", dict(_NX, **{"app/a.ts": "'use server'\nexport async function wipe(id: string) {\n  const s = await getSession()\n  if (!s) console.warn('no session')\n  await db.delete(t).where(eq(t.id, id))\n}\n"}), "next.server-actions")
+T.expect("P10 next: a session null test whose consequent only logs does not enforce (FAIL)", st == "FAIL", out)
+st, out = _pa("check_nextjs.py", dict(_NX, **{"app/a.ts": "'use server'\nexport async function wipe(id: string) {\n  if (!id) throw new Error('id')\n  const session = await getSession()\n  await db.delete(t).where(eq(t.id, id))\n}\n"}), "next.server-actions")
+T.expect("P10 next: a throw on bad input is not a rejection of a missing session (FAIL)", st == "FAIL", out)
+st, out = _pa("check_nextjs.py", dict(_NX, **{"app/a.ts": "'use server'\nexport async function wipe(id: string): Promise<{ error?: string }> {\n  const viewer = await loadViewer()\n  if (!viewer) return { error: 'sign in' }\n  await db.delete(t).where(eq(t.id, id))\n  return {}\n}\n"}), "next.server-actions")
+T.expect("P10 next: an object return type is not the body, and a custom identity read refused when missing enforces (PASS)", st == "PASS", out)
+st, out = _pa("check_nextjs.py", dict(_NX, **{"app/a.ts": "'use server'\nexport async function wipe(form: FormData) {\n  const user = form.get('user')\n  if (!user) throw new Error('user required')\n  await db.delete(t).where(eq(t.id, user))\n}\n"}), "next.server-actions")
+T.expect("P10 next: ...a 'user' read from the form is the caller's input, not an identity (FAIL)", st == "FAIL", out)
+st, out = _pa("check_nextjs.py", dict(_NX, **{"app/a.ts": "'use server'\nimport { auth } from '@clerk/nextjs/server'\nexport async function wipe(id: string) {\n  await auth.protect()\n  await db.delete(t).where(eq(t.id, id))\n}\n"}), "next.server-actions")
+T.expect("P10 next: Clerk auth.protect() enforces on its own (PASS)", st == "PASS", out)
+_sk = T.fake_key("stripe", 32)
+st, out = _pa("check_nextjs.py", dict(_NX, **{".env.production": "NEXT_PUBLIC_BILLING=%s\n" % _sk}), "next.public-env-secrets")
+T.expect("P10 next: a key-shaped value under a benign NEXT_PUBLIC_ name in a committed .env FAILs, value unprinted", st == "FAIL" and _sk not in out, "status %s" % st)
+st, out = _pa("check_nextjs.py", dict(_NX, **{".env.example": "NEXT_PUBLIC_SENTRY_DSN=\nNEXT_PUBLIC_ALGOLIA_SEARCH_KEY=\n"}), "next.public-env-secrets")
+T.expect("P10 next: a vendor's documented browser key (Sentry DSN, Algolia search-only) PASSes", st == "PASS", out)
+
+_GM = json.dumps({"webapp": {"access": "DOMAIN", "executeAs": "USER_ACCESSING"}, "oauthScopes": []})
+_HX = "7f3a9c1e5b2d4f6a8c0e1b3d5f7a9c2e"
+st, out = _pa("check_gas.py", {"appsscript.json": _GM, "Code.gs": "var FORM_KEY = '%s';\nfunction f() { UrlFetchApp.fetch('https://api.example.com', { headers: { Authorization: 'Bearer ' + FORM_KEY } }); }\n" % _HX}, "gas.keys-in-code")
+T.expect("P10 gas: a Drive-word name sent as a bearer is a key, not a Drive id (FAIL)", st == "FAIL", out)
+st, out = _pa("check_gas.py", {"appsscript.json": _GM, "Code.gs": "var PROPERTY_FOR_KEY = 'openWeatherApiKey_v2';\nfunction f() { return PropertiesService.getScriptProperties().getProperty(PROPERTY_FOR_KEY); }\n"}, "gas.keys-in-code")
+T.expect("P10 gas: a Script Property NAME passed to getProperty is not a value (PASS)", st == "PASS", out)
+st, out = _pa("check_gas.py", {".clasp.json": json.dumps({"rootDir": "dist"}), "dist/appsscript.json": _GM, "dist/Code.js": "const MAILGUN_KEY = `%s`;\n" % _HX}, "gas.keys-in-code")
+T.expect("P10 gas: a clasp rootDir under dist/ is read, and a backtick literal is a literal (FAIL)", st == "FAIL", out)
+
+_acct = json.loads(json.dumps(GOOD_SNAP))
+_z = _acct["zones"][0]
+_z["settings"]["security_header"] = {"strict_transport_security": {"enabled": True, "max_age": 300}}
+_zid = "cfacct.hsts.%s" % _z["name"].replace(".", "-")
+T.expect("P10 account: HSTS max_age 300 is under the 6-month minimum (FAIL)", snap_run(_acct)[1].get(_zid, {}).get("status") == "FAIL")
+_z["settings"]["security_header"] = {"strict_transport_security": {"enabled": True, "max_age": "15552000"}}
+T.expect("P10 account: a numeric-string max_age is read as its number (PASS)", snap_run(_acct)[1].get(_zid, {}).get("status") == "PASS")
+_w = json.loads(json.dumps(GOOD_SNAP))
+_w["workers"] = [{"id": "gw", "subdomain": {"enabled": True}, "settings": {"bindings": [{"type": "service", "name": "S", "service": "data"}]}},
+                 {"id": "data", "subdomain": {"enabled": False}, "settings": {"bindings": [{"type": "secrets_store_secret", "name": "K", "store_id": "s"}]}}]
+T.expect("P10 account: a workers.dev gateway with a service binding to a Worker holding a secret FAILs",
+         snap_run(_w)[1].get("cfacct.workers-dev-exposed", {}).get("status") == "FAIL")
+_w["workers"][1]["settings"]["bindings"] = [{"type": "plain_text", "name": "APP_ENV", "text": "prod"}]
+T.expect("P10 account: ...a service binding to a Worker holding only config PASSes",
+         snap_run(_w)[1].get("cfacct.workers-dev-exposed", {}).get("status") == "PASS")
+# ---- end Phase 10 platform-a ----
+
+# ---- Phase 10 audit fixes (names) ----
+# The connection-string variant rule lives in names.secret_name, so cf.vars-secrets and fly.env-secrets agree.
+_wv = lambda name: _pa("check_cloudflare.py", {"wrangler.toml": _W + '[vars]\n%s = "unset"\n' % name, "src/index.ts": _IDX}, "cf.vars-secrets")
+_fe = lambda name: _st("check_fly_supabase.py", {"fly.toml": 'app = "a"\n[env]\n  %s = "unset"\n' % name}, "fly.env-secrets")
+_c1, _o1 = _wv("DATABASE_URL_UNPOOLED")
+_f1, _p1 = _fe("DATABASE_URL_UNPOOLED")
+T.expect("P10 names: DATABASE_URL_UNPOOLED FAILs both cf.vars-secrets and fly.env-secrets", _c1 == "FAIL" and _f1 == "FAIL", "cf %s fly %s" % (_c1, _f1))
+_c2, _o2 = _wv("APP_URL_UNPOOLED")
+_f2, _p2 = _fe("APP_URL_UNPOOLED")
+T.expect("P10 names: a lookalike APP_URL_UNPOOLED PASSes both", _c2 == "PASS" and _f2 == "PASS", "cf %s fly %s" % (_c2, _f2))
+# ---- end Phase 10 audit fixes (names) ----
 
 T.finish()

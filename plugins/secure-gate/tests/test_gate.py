@@ -229,7 +229,7 @@ T.expect("timestamp: generated_at 30 days in the future is a gate error (never g
 repo, p = edited([P], generated_at=stamp(minutes=31))
 T.expect("timestamp: 31 minutes in the future is a gate error", gate(p, "--repo", repo).returncode == 2)
 repo, p = edited([P], generated_at=stamp(minutes=31))
-T.expect("timestamp: ...and --max-age-hours 0 (age check off) does not switch the future check off", gate(p, "--repo", repo, "--max-age-hours", "0").returncode == 2)
+T.expect("timestamp: ...and --max-age-hours 0 does not switch the future check off", gate(p, "--repo", repo, "--max-age-hours", "0").returncode == 2)
 repo, p = edited([P], generated_at=stamp(minutes=2))
 T.expect("timestamp: two minutes ahead is clock skew and passes", gate(p, "--repo", repo).returncode == 0)
 repo, p = edited([P], generated_at=datetime.datetime.now().replace(microsecond=0).isoformat())
@@ -256,5 +256,52 @@ T.expect("default run: the orchestrator's own output in REPO/security (untracked
 open(os.path.join(hono, "src", "debug.ts"), "w").write("app.get('/api/debug/env', (c) => c.json(Object.keys(c.env)))\n")
 r = gate(os.path.join(hono, "security", "findings.json"), "--repo", hono)
 T.expect("default run: ...and a source file added after that run is still refused", r.returncode == 2 and "another commit" in r.stdout, r.stdout[-200:])
+
+# ---- Phase 10 supply-core-gate ----
+# The binding is a hash of every non-ignored file's content (ledger.git_state), recomputed by the gate the same way.
+def _launch(repo, *extra):
+    return subprocess.run([sys.executable, os.path.join(HERE, "..", "..", "secure-core", "scripts", "secure_launch.py"), repo, "--only", "secure-app"] + list(extra),
+                          capture_output=True, text=True, env=T.clean_env())
+
+
+def _gate(p, *a, **kw):
+    return subprocess.run([sys.executable, GATE, p] + list(a), capture_output=True, text=True, env=T.clean_env(), **kw)
+
+
+_app = {"package.json": json.dumps({"dependencies": {"hono": "4.6.0"}}), ".gitignore": "node_modules\n",
+        "src/index.ts": "import { Hono } from 'hono'\nconst app = new Hono()\napp.get('/api/ping', (c) => c.text('ok'))\nexport default app\n"}
+_g = T.git_init(T.tree(dict(_app)))
+open(os.path.join(_g, "src", "extra.ts"), "w").write("export const x = 1\n")  # untracked at run time
+_idx = open(os.path.join(_g, ".git", "index"), "rb").read()
+_launch(_g)
+_ledger = os.path.join(_g, "security", "findings.json")
+r = _gate(_ledger, "--repo", _g)
+T.expect("P10 binding: a fresh default run gates clean (its own ledger is left out of the hash)", r.returncode == 0, r.stdout[-300:])
+T.expect("P10 binding: ...and neither the run nor the gate wrote the repo's index", open(os.path.join(_g, ".git", "index"), "rb").read() == _idx)
+r = subprocess.run([sys.executable, GATE, "security/findings.json", "--repo", "."], capture_output=True, text=True, cwd=_g, env=T.clean_env())
+T.expect("P10 binding: ...also from inside the repo with a relative ledger path (the hook shape)", r.returncode == 0, r.stdout[-300:])
+open(os.path.join(_g, "src", "extra.ts"), "w").write("export const x = 2\n")  # same `??` status line
+r = _gate(_ledger, "--repo", _g)
+T.expect("P10 binding: an untracked file edited after the run (same status line) refuses", r.returncode == 2 and "another commit or working tree" in r.stdout, r.stdout[-300:])
+_launch(_g)
+T.expect("P10 binding: ...a fresh run after the edit passes again", _gate(_ledger, "--repo", _g).returncode == 0)
+_out = T.tree({})
+_launch(_g, "--out", _out)
+T.expect("P10 binding: a ledger written outside the checkout gates clean", _gate(os.path.join(_out, "findings.json"), "--repo", _g).returncode == 0)
+_secret = os.path.join(_g, "src", "locked.ts")
+open(_secret, "w").write("x\n")
+_led2 = os.path.join(_out, "findings.json")
+_l = json.load(open(_led2)); _l["git"] = {"head": _l["git"]["head"], "status": None}; json.dump(_l, open(_led2, "w"))
+os.chmod(_secret, 0)
+r = _gate(_led2, "--repo", _g)
+os.chmod(_secret, 0o644)
+T.expect("P10 binding: a tree git cannot hash (an unreadable file) is a gate error, never a match of None to None",
+         r.returncode == 2 and "cannot hash" in r.stdout, r.stdout[-300:])
+# --max-age-hours has no off value
+repo, p = write_ledger([P])
+_l = json.load(open(p)); _l["generated_at"] = (datetime.datetime.now().astimezone() - datetime.timedelta(hours=1)).isoformat(timespec="seconds"); json.dump(_l, open(p, "w"))
+T.expect("P10 age: --max-age-hours 0 refuses an hour-old ledger (0 never switches the age check off)", _gate(p, "--repo", repo, "--max-age-hours", "0").returncode == 1)
+T.expect("P10 age: ...while --max-age-hours 2 ships it", _gate(p, "--repo", repo, "--max-age-hours", "2").returncode == 0)
+# ---- end Phase 10 supply-core-gate ----
 
 T.finish()

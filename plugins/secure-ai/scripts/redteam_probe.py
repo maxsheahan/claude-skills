@@ -88,7 +88,8 @@ def send(url, body, headers, timeout):
     req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST",
                                  headers=dict({"content-type": "application/json", "user-agent": "secure-launch-redteam"}, **headers))
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        # url passed is_local() in main: http(s) only, a local dev host, no credentials in the URL.
+        with urllib.request.urlopen(req, timeout=timeout) as r:  # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
             return r.status, r.read(400_000).decode("utf-8", "replace")
     except urllib.error.HTTPError as e:
         return e.code, ""

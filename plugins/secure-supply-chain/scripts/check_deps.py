@@ -8,7 +8,8 @@ Per package folder with a lockfile (root plus workspaces, never node_modules):
     resolves different versions). Inside a git repo a lockfile counts only when
     git would ship it: one that exists on disk but is git-ignored FAILs, since
     CI and production never see it. A workspace member (a folder matched by the
-    root package.json `workspaces` globs or pnpm-workspace.yaml `packages`) is
+    root package.json `workspaces` globs or pnpm-workspace.yaml `packages`, block
+    or flow style, `./` prefixes allowed, `!` exclusions honored) is
     locked by the root lockfile and PASSes naming it; its audit is the root's.
   - deps.audit.<dir>.<package>: one result per high or critical production
     advisory. FAIL unless security/advisory-triage.json records it as not
@@ -19,8 +20,11 @@ Per package folder with a lockfile (root plus workspaces, never node_modules):
     naming the child.
   - deps.audit.<dir>.moderate: moderate and low advisories, one result.
 Reports: npm 7+ (per-package map), pnpm and npm 6 (advisories keyed by id) and
-yarn classic (`yarn audit --json`, one JSON object per line) are all read; a
-yarn line whose resolution is dev-only is left out, as --omit=dev would.
+yarn classic (`yarn audit --json`, one JSON object per line) and yarn berry
+(`yarn npm audit --json`, {value, children} per line) are all read; a yarn
+line whose resolution is dev-only is left out, as --omit=dev would. Every
+package folder gets its lockfile check; at most 12 lockfiled folders are
+audited, the rest are UNKNOWN (never silently skipped).
 A major-version fix is named as such; nothing is ever installed or bumped.
 npm missing, offline, or an unparseable audit: UNKNOWN with the reason.
 """
@@ -111,9 +115,52 @@ def through(v):
     return [x for x in (v.get("via") or []) if isinstance(x, str)]
 
 
+def _yaml_list(text, key):
+    """The string items of a top-level YAML key, block style (`key:` then `- item` lines) or flow style
+    (`key: ['a', "b"]`, possibly over several lines). Enough YAML for pnpm-workspace.yaml."""
+    items, block, flow = [], False, None
+    for line in text.splitlines():
+        s = line.split(" #", 1)[0].rstrip() if not line.lstrip().startswith("#") else ""
+        st = s.strip()
+        if flow is not None:
+            flow += " " + st
+            if "]" in st:
+                break
+            continue
+        if not st:
+            continue
+        if not line.startswith((" ", "\t", "-")):
+            block = False
+            m = re.match(r"%s\s*:\s*(.*)$" % re.escape(key), st)
+            if m:
+                rest = m.group(1).strip()
+                if rest.startswith("["):
+                    flow = rest
+                    if "]" in rest:
+                        break
+                else:
+                    block = True
+            continue
+        if block and st.startswith("- "):
+            items.append(st[2:].strip())
+    if flow is not None:
+        items = [x.strip() for x in flow.strip().lstrip("[").split("]", 1)[0].split(",")]
+    return [x.strip().strip("'\"") for x in items if x.strip().strip("'\"")]
+
+
+def _norm_glob(g):
+    g = g.strip()
+    neg = g.startswith("!")
+    g = g[1:] if neg else g
+    while g.startswith("./"):
+        g = g[2:]
+    return neg, g.rstrip("/")
+
+
 def workspace_globs(folder):
     """Workspace member globs declared in this folder: package.json `workspaces` (npm, yarn, bun;
-    a list or {"packages": [...]}) and pnpm-workspace.yaml `packages:`. Negations are dropped."""
+    a list or {"packages": [...]}) and pnpm-workspace.yaml `packages:` (block or flow style).
+    Returns (include, exclude): a leading `./` is dropped, a leading `!` is an exclusion."""
     globs = []
     pkg = walk.package_json(folder) or {}
     ws = pkg.get("workspaces")
@@ -121,18 +168,19 @@ def workspace_globs(folder):
         ws = ws.get("packages")
     if isinstance(ws, list):
         globs += [g for g in ws if isinstance(g, str)]
-    yml = walk.read(os.path.join(folder, "pnpm-workspace.yaml"))
-    in_pkgs = False
-    for line in yml.splitlines():
-        s = line.strip()
-        if not s or s.startswith("#"):
-            continue
-        if not line.startswith((" ", "\t", "-")):
-            in_pkgs = s.startswith("packages:")
-            continue
-        if in_pkgs and s.startswith("- "):
-            globs.append(s[2:].strip().strip("'\""))
-    return [g.rstrip("/") for g in globs if g and not g.startswith("!")]
+    globs += _yaml_list(walk.read(os.path.join(folder, "pnpm-workspace.yaml")), "packages")
+    inc, exc = [], []
+    for g in globs:
+        neg, n = _norm_glob(g)
+        if n:
+            (exc if neg else inc).append(n)
+    return inc, exc
+
+
+def is_member(rel, globs):
+    """A folder is a workspace member when an include glob matches it and no exclusion does."""
+    inc, exc = globs
+    return any(glob_match(rel, g) for g in inc) and not any(glob_match(rel, g) for g in exc)
 
 
 def glob_match(rel, pattern):
@@ -160,9 +208,9 @@ def parse_report(text):
     objs = []
     try:
         whole = json.loads(text)
-        if not (isinstance(whole, dict) and "type" in whole and "data" in whole and "vulnerabilities" not in whole):
+        if not (isinstance(whole, dict) and "vulnerabilities" not in whole and (("type" in whole and "data" in whole) or _berry(whole))):
             return whole, None
-        objs = [whole]  # a one-line yarn report (summary only) is still yarn's shape
+        objs = [whole]  # a one-line yarn report (summary only, or one berry advisory) is still yarn's shape
     except ValueError:
         pass
     for line in [] if objs else text.splitlines():
@@ -185,6 +233,12 @@ def parse_report(text):
                 continue  # a dev-only path: not production, as --omit=dev would leave it out
             key = str(adv.get("id") or res.get("id") or len(advs) + 1)
             advs[key] = adv
+        elif _berry(o):
+            # yarn berry `yarn npm audit --json`: {"value": package, "children": {"ID", "URL", "Severity", ...}}
+            ch = o["children"]
+            key = str(ch.get("ID") or ch.get("URL") or len(advs) + 1)
+            advs[key] = {"id": ch.get("ID") or key, "module_name": o["value"], "severity": str(ch.get("Severity") or "low").lower(),
+                         "url": ch.get("URL") or "", "patched_versions": ch.get("Patched Versions") or ""}
         elif kind == "auditSummary" and isinstance(data, dict):
             summary = data
         elif kind == "error":
@@ -194,13 +248,25 @@ def parse_report(text):
     return {"advisories": advs, "metadata": summary or {}}, None
 
 
+def _berry(o):
+    return isinstance(o, dict) and isinstance(o.get("value"), str) and isinstance(o.get("children"), dict)
+
+
+def yarn_berry(folder):
+    """yarn 2+ (berry): a .yarnrc.yml, or a yarn.lock with a __metadata block."""
+    return os.path.exists(os.path.join(folder, ".yarnrc.yml")) or "__metadata:" in walk.read(os.path.join(folder, "yarn.lock"))[:2000]
+
+
 def package_dirs(repo):
     dirs = []
     for p in walk.files(repo, exts=("package.json",), tests=False):
         d = os.path.dirname(p)
         if d not in dirs:
             dirs.append(d)
-    return dirs[:12]
+    return dirs  # every folder gets its lockfile check; only the audits are capped (MAX_AUDITS)
+
+
+MAX_AUDITS = 12  # each live audit is a registry call of up to 180 s
 
 
 def audit(folder, tool, saved):
@@ -216,7 +282,12 @@ def audit(folder, tool, saved):
             return None, "bun has no audit command"
     if not shutil.which("npm"):
         return None, "npm not installed"
-    cmd = ["npm", "audit", "--omit=dev", "--json"] if tool == "npm" else [tool, "audit", "--prod", "--json"]
+    if tool == "npm":
+        cmd = ["npm", "audit", "--omit=dev", "--json"]
+    elif tool == "yarn" and yarn_berry(folder):
+        cmd = ["yarn", "npm", "audit", "--environment", "production", "--recursive", "--json"]
+    else:
+        cmd = [tool, "audit", "--prod", "--json"]
     try:
         r = subprocess.run(cmd, cwd=folder, capture_output=True, text=True, timeout=180)
     except subprocess.TimeoutExpired:
@@ -271,9 +342,10 @@ def main():
     roots = []
     for d in dirs:
         lock = next((f for f in LOCKS if lockfile_present(repo, d, f) == "present"), None)
-        globs = workspace_globs(d) if lock else []
-        if globs:
+        globs = workspace_globs(d) if lock else ([], [])
+        if globs[0]:
             roots.append((d, lock, globs))
+    audited = 0
     for d in dirs:
         rel = walk.rel(repo, d) if d != repo else "."
         tag = "root" if rel == "." else rel.replace("/", "_")
@@ -281,7 +353,7 @@ def main():
         locks = [f for f, s in states.items() if s == "present"]
         if not locks:
             owner = next(((r, lock) for r, lock, globs in roots if r != d and d.startswith(r + os.sep)
-                          and any(glob_match(walk.rel(r, d), g) for g in globs)), None)
+                          and is_member(walk.rel(r, d), globs)), None)
             if owner:
                 rrel = walk.rel(repo, owner[0]) if owner[0] != repo else "."
                 res.append(result("deps.lockfile.%s" % tag, "Lockfile present in %s" % rel, "PASS",
@@ -297,6 +369,11 @@ def main():
                                   severity="medium", fix="commit a lockfile and install with npm ci so every build resolves the same versions"))
             continue
         res.append(result("deps.lockfile.%s" % tag, "Lockfile present in %s" % rel, "PASS", "%s/%s" % (rel, locks[0])))
+        audited += 1
+        if audited > MAX_AUDITS:
+            res.append(result("deps.audit.%s" % tag, "Production advisories in %s" % rel, "UNKNOWN", "%s/%s" % (rel, locks[0]),
+                              reason="not audited: more than %d folders with their own lockfile; run the audit in this folder by hand" % MAX_AUDITS))
+            continue
         data, why = audit(d, LOCKS[locks[0]], a.audit_json)
         if data is None:
             res.append(result("deps.audit.%s" % tag, "Production advisories in %s" % rel, "UNKNOWN", "%s/%s" % (rel, locks[0]), reason=why))

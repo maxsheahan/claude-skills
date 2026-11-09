@@ -123,15 +123,23 @@ def all_package_jsons(repo):
         yield p
 
 
-def strip_comments(text, path="", strings=True):
+def strip_comments(text, path="", strings=True, interp=False):
     """Blank out comments, keeping every newline (so line numbers hold) and
     every string literal (so 'https://x' survives). A comment saying
-    '// TODO: add a rate limit' must never satisfy a check (Phase 5 audit)."""
+    '// TODO: add a rate limit' must never satisfy a check (Phase 5 audit).
+    interp=True (with strings=False) keeps the code inside a template literal's
+    ${...}: `https://${host}/x` blanks the text but keeps `host`, the value
+    that flows. The output is always the input's length (offsets hold)."""
     py = path.endswith(".py")
     out, i, n = [], 0, len(text)
     quote = None
     while i < n:
         ch = text[i]
+        if quote == "`" and interp and not strings and text.startswith("${", i):
+            j = _interp_end(text, i + 1)
+            out.append(text[i:j])
+            i = j
+            continue
         if quote:
             if ch == "\\" and i + 1 < n:
                 out.append(text[i:i + 2] if strings else "  ")
@@ -191,6 +199,19 @@ def strip_comments(text, path="", strings=True):
     return "".join(out)
 
 
+def _interp_end(text, i):
+    """Index just past the `}` closing the `{` at i (a template interpolation), braces counted naively."""
+    depth, n = 0, len(text)
+    for j in range(i, n):
+        if text[j] == "{":
+            depth += 1
+        elif text[j] == "}":
+            depth -= 1
+            if depth == 0:
+                return j + 1
+    return n
+
+
 def _regex_context(out):
     """True when a '/' here starts a regex literal: after ( , = : [ ! & | ? { } ; or return."""
     k = len(out) - 1
@@ -224,13 +245,14 @@ def _regex_end(text, i):
     return i + 1  # not a regex after all: treat as a plain slash
 
 
-def read_code(path, strings=True):
+def read_code(path, strings=True, interp=False):
     """The file's text with comments blanked, for every check that judges code.
     strings=False also blanks string contents: for evidence that must be an
-    identifier or a call (a cap, a limiter), never prose in a prompt."""
+    identifier or a call (a cap, a limiter), never prose in a prompt.
+    interp=True keeps template-literal interpolations in that view (see strip_comments)."""
     t = read(path)
     if path.endswith(CODE_EXT):
-        return strip_comments(t, path, strings)
+        return strip_comments(t, path, strings, interp)
     return t
 
 
@@ -305,3 +327,54 @@ def decl_src(name, *scopes):
         if m:
             return m.group(1)
     return ""
+
+
+# ---- import bindings (Phase 10, 2026-11-07) ----
+# surface.import_names reads relative named and default imports. The spend and fetch checks also need the
+# shapes a real app writes: `import * as geo from './geo'` (geo.reverseGeocode), a Next/Vite path alias
+# (`@/lib/geo`, `~/lib/geo`), CommonJS `const geo = require('./geo')` and `const { a: b } = require(...)`.
+IMPORT_BIND = re.compile(
+    r"""\bimport\s+(?!type\b)(?:(?P<default>[A-Za-z_$][\w$]*)\s*,?\s*)?(?:\*\s*as\s+(?P<ns>[A-Za-z_$][\w$]*)\s*)?(?:\{(?P<named>[^}]*)\})?\s*from\s*['"](?P<spec>[^'"]+)['"]"""
+    r"""|\b(?:const|let|var)\s+(?:(?P<cjs>[A-Za-z_$][\w$]*)|\{(?P<cjsnamed>[^}]*)\})\s*=\s*require\(\s*['"](?P<cjsspec>[^'"]+)['"]\s*\)""")
+ALIAS_ROOTS = ("", "src/")  # where `@/x` and `~/x` point in the common Next, Vite and Nuxt setups
+_EXTS = ("", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", "/index.ts", "/index.tsx", "/index.js")
+
+
+def resolve_spec(repo, rel, spec):
+    """The repo-relative file an import specifier names: relative (./x, ../x, a .js naming the .ts it
+    compiles from) or a root alias (@/x, ~/x); None for a package import or a file that is not there."""
+    if spec.startswith("."):
+        bases = [os.path.normpath(os.path.join(os.path.dirname(rel), spec))]
+    elif re.match(r"^[@~]/", spec):
+        bases = [os.path.normpath(root + spec[2:]) for root in ALIAS_ROOTS]
+    else:
+        return None
+    for base in bases:
+        for b in (base, re.sub(r"\.(?:js|mjs|cjs)$", "", base)):
+            for e in _EXTS:
+                cand = b + e
+                if os.path.isfile(os.path.join(repo, cand)):
+                    return cand.replace(os.sep, "/")
+    return None
+
+
+def import_bindings(repo, rel, text=None):
+    """local name -> (file, exported name) for every import of a repo file in rel; a namespace import or a
+    whole-module require maps to (file, '*'). Type-only members are skipped."""
+    if text is None:
+        text = read_code(os.path.join(repo, rel))
+    out = {}
+    for m in IMPORT_BIND.finditer(text):
+        target = resolve_spec(repo, rel, m.group("spec") or m.group("cjsspec"))
+        if not target:
+            continue
+        if m.group("default"):
+            out[m.group("default")] = (target, "default")
+        if m.group("ns") or m.group("cjs"):
+            out[m.group("ns") or m.group("cjs")] = (target, "*")
+        for x in (m.group("named") or m.group("cjsnamed") or "").split(","):
+            x = x.strip()
+            if x and not x.startswith("type "):
+                parts = re.split(r"\s+as\s+|\s*:\s*", x)
+                out[parts[-1].strip()] = (target, parts[0].strip())
+    return out

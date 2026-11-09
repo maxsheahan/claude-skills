@@ -1,6 +1,6 @@
 {
   "name": "secure-gate",
-  "version": "0.5.5",
+  "version": "0.6.1",
   "author": { "name": "Max Sheahan" },
   "description": "Enforce the secure-launch ledger: a gate that refuses on FAIL and on any UNKNOWN the owner has not accepted, and drop-in templates (GitHub Actions workflow, deploy-script gate, pre-push hook) vendored into a repo only on request. Requires secure-core."
 }

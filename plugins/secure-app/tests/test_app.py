@@ -111,9 +111,7 @@ T.status_is("fetch good", c, "fetch.data-url", "PASS", out)
 mixed = dict(GOOD)
 mixed["src/other.ts"] = "export async function grab(item) { return fetch(item.image) }\n"
 rc, c, out = T.run(os.path.join(S, "check_fetch.py"), T.tree(mixed))
-# Phase 8 (bench case fetch.data-url.guard-exists-one-raw-site): a raw fetch beside a guard FUNCTION it does not call is a FAIL, not UNKNOWN
-T.status_is("fetch guard function exists but a raw site does not call it", c, "fetch.data-url", "FAIL", out)
-T.expect("fetch: the FAIL names the uncalled guard", "do not call it" in c.get("fetch.data-url", {}).get("detail", ""), out[-300:])
+T.status_is("fetch guard exists but a raw site remains", c, "fetch.data-url", "UNKNOWN", out)
 
 rc, c, out = T.run(os.path.join(S, "check_spend.py"), bad)
 for cid in ("spend.cap.anthropic", "spend.unset-cap", "spend.open-proxy", "spend.per-client", "spend.llm-params"):
@@ -366,11 +364,19 @@ GOOD_M = {"wrangler.toml": RL,
           "src/lib/ai-guard.ts": "export async function reserveAiBudget(env) {\n  const key = `ai:count:${new Date().toISOString().slice(0, 10)}`\n  const n = Number(await env.CACHE.get(key)) || 0\n  if (n >= 150) throw new BudgetExhaustedError(n, 150)\n  await env.CACHE.put(key, String(n + 1))\n}\n",
           "src/routes/classical.ts": "import { reserveAiBudget } from '../lib/ai-guard'\nasync function callClaudeJson(prompt: string, env: Env): Promise<{ chart?: string; source?: string }> {\n  await reserveAiBudget(env)\n  const res = await fetch('https://api.anthropic.com/v1/messages', { method: 'POST' })\n  return res.json()\n}\n",
           "src/routes/sdk.ts": "import Anthropic from '@anthropic-ai/sdk'\nexport async function feedback(env) {\n  const key = `feedback:count:${day}`\n  const current = Number(await env.STATE.get(key)) || 0\n  if (current >= 40) return null\n  await env.STATE.put(key, String(current + 1))\n  const client = new Anthropic({ apiKey: env.ANTHROPIC_API_KEY })\n  return client.messages.create({ model: MODEL, max_tokens: 400, messages: [] })\n}\n",
-          "src/routes/lookup.ts": "import { reserveDailyBudget } from '../lib/ai-guard'\nasync function llm(env, q) { return fetch('https://api.openai.com/v1/chat/completions') }\napp.get('/lookup', async (c) => {\n  const { success } = await c.env.AI_LIMITER.limit({ key: c.req.header('cf-connecting-ip') ?? 'anon' })\n  if (!success) return c.json({}, 429)\n  const b = await reserveDailyBudget(c.env, 'lookup', 50)\n  if (!b.ok) return c.json({}, 429)\n  return c.json(await llm(c.env, c.req.query('q')))\n})\n"}
+          "src/routes/lookup.ts": "import { reserveDailyBudget } from '../lib/ai-guard'\nasync function llm(env, q) { return fetch('https://api.openai.com/v1/chat/completions') }\napp.get('/lookup', async (c) => {\n  const b = await reserveDailyBudget(c.env, 'lookup', 50)\n  if (!b.ok) return c.json({}, 429)\n  return c.json(await llm(c.env, c.req.query('q')))\n})\n"}
 rc, c, out = T.run(MT, T.tree(GOOD_M))
 T.expect("meter good: a reservation above the call, an SDK call after a day-keyed KV counter, and a route-level reservation before a helper all PASS",
-         rc == 0 and c.get("meter.anthropic", {}).get("status") == "PASS" and c.get("meter.openai", {}).get("status") == "PASS" and c.get("meter.ratelimit-binding", {}).get("status") == "PASS", out[-400:])
-T.expect("meter good: the ratelimit PASS says the binding is best-effort and the counter is the hard cap", "best-effort" in c.get("meter.ratelimit-binding", {}).get("detail", "") and "hard cap" in c["meter.ratelimit-binding"]["detail"])
+         c.get("meter.anthropic", {}).get("status") == "PASS" and c.get("meter.openai", {}).get("status") == "PASS", out[-400:])
+# Phase 10: GOOD_M declares [[ratelimits]] AI_LIMITER and no code calls .limit() on it. The skill (step 5 and its
+# known-bad list) and the bench (meter.ratelimit-binding.declared-never-called) both say a binding nobody calls
+# limits nothing: FAIL medium. The fixture stays as written; the counters above are what PASS.
+T.expect("meter good: ...but its declared, never-called AI_LIMITER binding is FAIL medium",
+         c.get("meter.ratelimit-binding", {}).get("status") == "FAIL" and c.get("meter.ratelimit-binding", {}).get("severity") == "medium", out[-400:])
+# the PASS wording is read on GOOD_M with the route calling its binding (GOOD_M itself never calls it)
+GOOD_M_RL = dict(GOOD_M, **{"src/routes/lookup.ts": GOOD_M["src/routes/lookup.ts"].replace("  const b = await", "  const { success } = await c.env.AI_LIMITER.limit({ key: c.req.header('cf-connecting-ip') ?? 'anon' })\n  if (!success) return c.json({}, 429)\n  const b = await")})
+rc, c, out = T.run(MT, T.tree(GOOD_M_RL))
+T.expect("meter good: the ratelimit PASS says the binding is best-effort and the counter is the hard cap", c.get("meter.ratelimit-binding", {}).get("status") == "PASS" and "best-effort" in c.get("meter.ratelimit-binding", {}).get("detail", "") and "hard cap" in c["meter.ratelimit-binding"]["detail"], out[-300:])
 r, out = mt({"wrangler.toml": RL, "src/a.ts": "// await reserveAiBudget(env) before the call\nexport async function ask(env) { return fetch('https://api.anthropic.com/v1/messages') }\n"}, "meter.anthropic")
 T.expect("meter: a reservation in a comment is not a counter", r.get("status") == "FAIL", out[-200:])
 rc, c, out = T.run(MT, T.tree({"wrangler.toml": RL, "src/a.ts": "export async function h() { return fetch('https://example.org/') }\n"}))
@@ -757,5 +763,226 @@ for case in _bench_cases("secure_app_mcp_descriptions.py"):
     rc, c, out = mcp_run(T.tree(case["files"]))
     for cid, want in case["expect"].items():
         T.status_is("mcp desc %s" % case["id"], c, cid, want, out)
+
+# ---- Phase 10 app-auth ----
+# One FAIL and one PASS per mechanism added in Phase 10 to check_app.py and check_auth_gates.py (the audit's own
+# fixtures become bench cases later; these are written fresh).
+def _h(src):
+    return {"src/index.ts": "import { Hono } from 'hono'\nconst app = new Hono()\n" + src + "\nexport default app\n"}
+# auth_ref, operand by operand
+s, out = app8(_h("app.put('/api/docs/:id', async (c) => {\n  const form = await c.req.json()\n  const doc = await c.env.DB.prepare('SELECT * FROM docs WHERE id = ?').bind(c.req.param('id')).first()\n  if (doc.authored_by !== form.authored_by) return c.json({}, 403)\n  return c.json({ ok: 1 })\n})"), "app.object-writes")
+T.expect("P10 app: a 403 comparing a row field to the caller's own body field is no gate", s == "FAIL", out[-300:])
+s, out = app8(_h("app.put('/api/docs/:id', async (c) => {\n  const visitor = c.get('visitor')\n  if (!visitor) {\n    log('x')\n    log('y')\n    log('z')\n    return c.json(\n      {},\n      401,\n    )\n  }\n  return c.json({ ok: 1 })\n})"), "app.object-writes")
+T.expect("P10 app: ...a wrapped 401 under `if (!visitor)` five lines up, visitor from c.get(), is a gate", s == "PASS", out[-300:])
+# raw Worker methods
+_w = lambda body: {"wrangler.toml": 'name = "w"\nmain = "src/index.ts"\n', "src/index.ts": "export default {\n  async fetch(req, env) {\n    const u = new URL(req.url)\n" + body + "\n    return new Response('', { status: 404 })\n  },\n}\n"}
+s, out = st("check_app.py", _w("    if (u.pathname.startsWith('/v1/docs')) {\n      switch (req.method) {\n        case 'GET': return Response.json({})\n        case 'PATCH': await env.DB.prepare('UPDATE docs SET x = 1').run(); return new Response('')\n      }\n    }"), "app.object-writes")
+T.expect("P10 app: a Worker switch on req.method under startsWith('/v1/docs') is an object write", s == "FAIL", out[-300:])
+s, out = st("check_app.py", _w("    if (u.pathname.startsWith('/static/')) return env.ASSETS.fetch(req)\n    if (u.pathname.startsWith('/v1/docs/') && req.method === 'PATCH') {\n      const sess = await getSession(req, env)\n      if (!sess) return new Response('', { status: 401 })\n      return new Response('')\n    }"), "app.object-writes")
+T.expect("P10 app: ...a GET asset route does not borrow the next line's PATCH", s == "PASS", out[-300:])
+# debug words: strong with any continuation, soft only with a debug-shaped tail
+s, out = app8(_h("app.get('/ops/dumpEnv', (c) => c.json(c.env))"), "app.debug-routes")
+T.expect("P10 app: /ops/dumpEnv is a debug route", s == "FAIL", out[-300:])
+s, out = app8(_h("app.get('/api/seed-varieties', (c) => c.json([]))\napp.get('/api/env-banner', (c) => c.json({}))"), "app.debug-routes")
+T.expect("P10 app: .../api/seed-varieties and /api/env-banner are product routes", s == "PASS", out[-300:])
+# sign-out SQL: a session row by its id, or a revocation column, on any table
+s, out = app8(_h("app.post('/api/logout', async (c) => {\n  await c.env.DB.prepare('UPDATE accounts SET token_epoch = token_epoch + 1 WHERE id = ?').bind(1).run()\n  return c.json({})\n})"), "app.signout")
+T.expect("P10 app: bumping a token_epoch column revokes the session", s == "PASS", out[-300:])
+s, out = app8(_h("app.post('/api/logout', async (c) => {\n  await c.env.DB.prepare('UPDATE accounts SET last_ip = ? WHERE id = ?').bind('x', 1).run()\n  return c.json({})\n})"), "app.signout")
+T.expect("P10 app: ...updating last_ip revokes nothing", s == "FAIL", out[-300:])
+# error leak: a stack inside an object literal local; a `stack:` key elsewhere is not the local
+s, out = app8(_h("app.onError((e, c) => {\n  const info = { msg: e.message, trace: e.stack }\n  return c.json(info, 500)\n})"), "app.error-leak")
+T.expect("P10 app: a stack copied into an object literal and sent leaks", s == "FAIL", out[-300:])
+s, out = app8(_h("app.onError((e, c) => {\n  const trace = e.stack\n  console.error(trace)\n  return c.json({ error: 'oops' }, 500)\n})\napp.get('/api/about', (c) => c.json({ trace: 'none' }))"), "app.error-leak")
+T.expect("P10 app: ...a logged local and a later `trace:` key leak nothing", s == "PASS", out[-300:])
+# header identity: Django META, destructuring; an assignment is a write
+s, out = st("check_app.py", {"requirements.txt": "django==5.1\n", "app/views.py": "def me(request):\n    acct = request.META.get('HTTP_X_ACCOUNT_ID')\n    return acct\n"}, "app.header-identity")
+T.expect("P10 app: request.META.get('HTTP_X_ACCOUNT_ID') is identity from a header", s == "FAIL", out[-300:])
+s, out = st("check_app.py", {"package.json": json.dumps({"dependencies": {"express": "4.21.0"}}), "src/gw.js": "export function fwd(req, res, next) {\n  req.headers['x-member-id'] = String(res.locals.verified.id)\n  next()\n}\n"}, "app.header-identity")
+T.expect("P10 app: ...assigning headers['x-member-id'] is a write, not a read", s == "PASS", out[-300:])
+# CORS: the callback handing the origin back; a function returning a fixed origin after a compare is not reflection
+s, out = st("check_app.py", {"package.json": json.dumps({"dependencies": {"express": "4.21.0", "cors": "2.8.5"}}), "src/s.js": "app.use(cors({ origin: function (o, done) { done(null, o) }, credentials: true }))\n"}, "app.cors")
+T.expect("P10 app: origin: function (o, done) { done(null, o) } reflects", s == "FAIL", out[-300:])
+s, out = st("check_app.py", {"package.json": json.dumps({"dependencies": {"koa": "2.15.0", "@koa/cors": "5.0.0"}}), "src/s.js": "app.use(cors({ origin: (ctx) => ctx.get('Origin') === 'https://a.example.org' ? 'https://a.example.org' : '', credentials: true }))\n"}, "app.cors")
+T.expect("P10 app: ...comparing the Origin to one fixed value is not reflection", s == "PASS", out[-300:])
+# auth.off-switch: aliases with a default, env names read word by word, the Authorization header READ
+r, out = ag(_h("app.use('/ops/*', async (c, next) => {\n  const key = c.env.OPS_ADMIN_KEY || ''\n  if (!key) return next()\n  return bearerAuth({ token: key })(c, next)\n})"), "auth.off-switch")
+T.expect("P10 gates: `const key = c.env.X || ''` then `if (!key) return next()` is an off-switch", r.get("status") == "FAIL", out[-300:])
+r, out = ag(_h("app.use('*', async (c, next) => {\n  if (!c.env.PASSTHROUGH_MODE) return next()\n  c.header('x-mode', 'pt')\n  await next()\n})"), "auth.off-switch")
+T.expect("P10 gates: ...PASSTHROUGH_MODE has no PASS word", r.get("status") == "PASS", out[-300:])
+r, out = ag(_h("app.use('*', async (c, next) => {\n  if (!c.env.METRICS_TOKEN) return next()\n  await fetch('https://m.example.net', { headers: { \"authorization\": c.env.METRICS_TOKEN } })\n  await next()\n})"), "auth.off-switch")
+T.expect("P10 gates: ...sending an Authorization header is not reading one", r.get("status") == "PASS", out[-300:])
+r, out = ag(_h("app.use('*', async (c, next) => {\n  if (!c.env.METRICS_TOKEN) return next()\n  if (c.req.header('Authorization') !== c.env.METRICS_TOKEN) return c.redirect('/')\n  await next()\n})"), "auth.off-switch")
+T.expect("P10 gates: ...reading it is a guard", r.get("status") == "FAIL", out[-300:])
+# auth.access-jwt: jsonwebtoken, options imported from another file, a bare verify from hono/jwt
+_aj = lambda files: dict({"wrangler.toml": W_ROUTED}, **files)
+r, out = ag(_aj({"src/a.ts": "import jwt from 'jsonwebtoken'\nimport { OPTS } from './opts'\nexport const gate = (c) => jwt.verify(c.req.header('Cf-Access-Jwt-Assertion'), KEY, OPTS)\n", "src/opts.ts": "export const OPTS = { issuer: 'https://t.cloudflareaccess.com', audience: 'aud' }\n"}), "auth.access-jwt")
+T.expect("P10 gates: jwt.verify with options imported from another file is verification with issuer and audience", r.get("status") == "PASS", out[-300:])
+r, out = ag(_aj({"src/a.ts": "import { verify as check } from 'hono/jwt'\nexport const gate = (c) => check(c.req.header('Cf-Access-Jwt-Assertion'), KEY, 'RS256')\n"}), "auth.access-jwt")
+T.expect("P10 gates: ...a hono/jwt verify without issuer and audience FAILs medium", r.get("status") == "FAIL" and r.get("severity") == "medium", out[-300:])
+# auth.open-signup: the refusal must reach the sign-up API (positive path test, not a GET-only page)
+_ba = {"package.json": json.dumps({"dependencies": {"better-auth": "1.3.4"}}), "lib/auth.ts": "import { betterAuth } from 'better-auth'\nexport const auth = betterAuth({ emailAndPassword: { enabled: true } })\n"}
+r, out = ag(dict(_ba, **{"src/edge.ts": "export function gate(path, user) {\n  if (!path.includes('/sign-up') && !user) { return new Response('', { status: 401 }) }\n}\n"}), "auth.open-signup")
+T.expect("P10 gates: a public-path list that exempts sign-up is no refusal", r.get("status") == "FAIL", out[-300:])
+r, out = ag(dict(_ba, **{"src/edge.ts": "export function gate(path) {\n  if (path.startsWith('/api/auth/sign-up')) { return new Response('', { status: 403 }) }\n}\n"}), "auth.open-signup")
+T.expect("P10 gates: ...refusing every /api/auth/sign-up path is", r.get("status") == "PASS", out[-300:])
+# ---- end Phase 10 app-auth ----
+
+
+# ---- Phase 10 app-spend ----
+# One FAIL and one PASS fixture per mechanism added in Phase 10 (check_fetch, check_spend, check_metering, walk).
+_FN = {"package.json": json.dumps({"dependencies": {"hono": "4.6.0", "express": "4.21.0"}}), "fly.toml": 'app = "x"\n'}
+
+def f10(files, cid):
+    return st("check_fetch.py", dict(_FN, **files), cid)
+
+_RESOLVING = "import ipaddr from 'ipaddr.js'\nimport { lookup } from 'node:dns/promises'\nexport async function ensurePublic(u: URL) {\n  const { address } = await lookup(u.hostname)\n  if (ipaddr.parse(address).range() !== 'unicast') throw new Error('blocked')\n}\n"
+# fetch.data-url: a guard that resolves and checks the address, beside a raw site, is FAIL; called on the URL first, PASS
+s, out = f10({"src/net.ts": _RESOLVING, "src/a.ts": "export async function grab(p) { return fetch(p.avatarUrl) }\n"}, "fetch.data-url")
+T.expect("P10 fetch: a resolving guard the raw site does not call is FAIL", s == "FAIL", out[-300:])
+s, out = f10({"src/net.ts": _RESOLVING, "src/a.ts": "import { ensurePublic } from './net'\nexport async function grab(p) {\n  const u = new URL(p.avatarUrl)\n  await ensurePublic(u)\n  return fetch(u)\n}\n"}, "fetch.data-url")
+T.expect("P10 fetch: the guard called on the same URL before the fetch is PASS", s == "PASS", out[-300:])
+s, out = f10({"src/net.ts": _RESOLVING, "src/a.ts": "import { ensurePublic } from './net'\nexport async function grab(p) {\n  await ensurePublic(new URL(p.homepage))\n  return fetch(p.avatarUrl)\n}\n"}, "fetch.data-url")
+T.expect("P10 fetch: the guard called on a different value does not guard the fetch", s == "FAIL", out[-300:])
+# fetch.data-url: an agent below the call sites counts only when it does its own lookup
+s, out = f10({"src/net.ts": _RESOLVING, "src/agent.ts": "import https from 'node:https'\nexport const agent = new https.Agent({ keepAlive: true })\n", "src/a.ts": "export async function grab(p) { return fetch(p.avatarUrl) }\n"}, "fetch.data-url")
+T.expect("P10 fetch: a keep-alive agent is not a guard below the call sites (FAIL)", s == "FAIL", out[-300:])
+s, out = f10({"src/net.ts": _RESOLVING, "src/agent.ts": "import { Agent, setGlobalDispatcher } from 'undici'\nsetGlobalDispatcher(new Agent({ connect: { lookup: publicOnlyLookup } }))\n", "src/a.ts": "export async function grab(p) { return fetch(p.avatarUrl) }\n"}, "fetch.data-url")
+T.expect("P10 fetch: a global dispatcher with its own lookup makes the raw site UNKNOWN", s == "UNKNOWN", out[-300:])
+# fetch: an SSRF-filter agent handed to the call guards it
+_SRF = "import axios from 'axios'\nimport { useAgent } from 'request-filtering-agent'\napp.get('/api/p', async (req, res) => {\n  const t = String(req.query.url)\n  const r = await axios.get(t%s)\n  res.json({ n: 1 })\n})\n"
+s, out = f10({"src/s.js": _SRF % ", { httpAgent: useAgent(t), httpsAgent: useAgent(t) }"}, "fetch.request-url")
+T.expect("P10 fetch: request-filtering-agent on the call is a guard (request-url PASS)", s == "PASS", out[-300:])
+s, out = f10({"src/s.js": _SRF % ""}, "fetch.request-url")
+T.expect("P10 fetch: ...the same call without the agent is FAIL", s == "FAIL", out[-300:])
+# fetch: constant URLs are judged per branch and across modules
+s, out = f10({"src/a.ts": "export async function pull(item) {\n  const u = item.link ?? 'https://fallback.example.org/feed.xml'\n  return fetch(u)\n}\n"}, "fetch.data-url")
+T.expect("P10 fetch: `data ?? 'https://literal'` is not constant (FAIL)", s == "FAIL", out[-300:])
+s, out = f10({"src/a.ts": "export async function pull(cfg) {\n  const u = cfg.backup ? 'https://b.example.org/x' : 'https://a.example.org/x'\n  return fetch(u)\n}\n"}, "fetch.data-url")
+T.expect("P10 fetch: a ternary of two owner literals is constant (PASS)", s == "PASS", out[-300:])
+s, out = f10({"src/config.ts": "export const endpoints = { weather: 'https://api.weather.example/v1' } as const\nexport const STATUS = 'https://status.example.com/x'\n",
+              "src/a.ts": "import { endpoints, STATUS } from './config'\nexport async function a() { return fetch(endpoints.weather) }\nexport async function b() { return fetch(STATUS) }\n"}, "fetch.data-url")
+T.expect("P10 fetch: a constant or constant map imported from another module is constant (PASS)", s == "PASS", out[-300:])
+s, out = f10({"src/a.ts": "export async function a(id) { return fetch('https://api.example.com' + id) }\n"}, "fetch.data-url")
+T.expect("P10 fetch: a literal host with no `/` after it does not fix the host ('@evil' appends to it): FAIL", s == "FAIL", out[-300:])
+# fetch: server entries in a module with React hooks are server code
+_RR = "import { useState } from 'react'\nexport async function %s({ request }) {\n  const r = await fetch(new URL(request.url).searchParams.get('u') ?? '')\n  return { t: await r.text() }\n}\nexport default function P() { const [o] = useState(false); return o }\n"
+s, out = f10({"app/routes/p.tsx": _RR % "loader"}, "fetch.data-url")
+T.expect("P10 fetch: a loader beside a hooks component is a server fetch (FAIL)", s == "FAIL", out[-300:])
+s, out = f10({"app/routes/p.tsx": _RR % "clientLoader"}, "fetch.data-url")
+T.expect("P10 fetch: a clientLoader runs in the browser (PASS)", s == "PASS", out[-300:])
+# fetch.request-url: request accessors, locals and config objects
+s, out = f10({"src/s.js": "app.post('/api/h', async (request, reply) => {\n  const target = 'https://' + request.body.host + '/x'\n  const r = await axios({ method: 'POST', url: target.trim() })\n  return {}\n})\n"}, "fetch.request-url")
+T.expect("P10 fetch: request.body into a concatenated local into an axios config url is FAIL", s == "FAIL", out[-300:])
+s, out = f10({"src/s.js": "app.post('/api/h', async (request, reply) => {\n  const id = request.body.id\n  const r = await axios({ method: 'GET', url: `https://api.example.com/items/${id}` })\n  return {}\n})\n"}, "fetch.request-url")
+T.expect("P10 fetch: ...a request value only in the path of a fixed host is PASS", s == "PASS", out[-300:])
+s, out = f10({"src/index.ts": "const SOURCES = { a: 'https://n.example.org/a.rss' }\napp.get('/api/f', async (c) => {\n  const t = SOURCES[c.req.query('f') ?? ''] ?? c.req.query('url')\n  return c.text(await (await fetch(t)).text())\n})\n"}, "fetch.request-url")
+T.expect("P10 fetch: an allowlist lookup with a raw request fallback is FAIL", s == "FAIL", out[-300:])
+s, out = f10({"src/index.ts": "import { safeFetch } from './sf'\napp.get('/api/f', async (c) => {\n  await safeFetch('https://status.example.com')\n  return c.text(await (await fetch(c.req.query('url'))).text())\n})\n"}, "fetch.request-url")
+T.expect("P10 fetch: a guard call elsewhere in the handler does not guard a raw fetch (FAIL)", s == "FAIL", out[-300:])
+s, out = f10({"requirements.txt": "fastapi\nrequests\n", "app/main.py": "import requests\nfrom fastapi import FastAPI, Request\napp = FastAPI()\n\n@app.get('/api/p')\ndef p(url: str, request: Request):\n    return requests.get(url, timeout=5).text\n"}, "fetch.request-url")
+T.expect("P10 fetch: a FastAPI parameter fetched with requests is FAIL", s == "FAIL", out[-300:])
+s, out = f10({"requirements.txt": "fastapi\nrequests\n", "app/main.py": "import requests\nfrom fastapi import FastAPI\napp = FastAPI()\n\n@app.get('/api/p')\ndef p(city: str):\n    return requests.get('https://api.weather.example/v1', params={'q': city}).text\n"}, "fetch.request-url")
+T.expect("P10 fetch: a FastAPI parameter sent as a query to a fixed host is PASS", s == "PASS", out[-300:])
+
+# spend.unset-cap: a cap binding that can be unlimited on any branch; a NaN branch that proceeds
+_PAID10 = "export async function ask(){ return fetch('https://api.anthropic.com/v1/messages') }\n"
+s, out = st("check_spend.py", {"src/a.ts": "const cap = env.CAP ? Number(env.CAP) : Infinity\n" + _PAID10}, "spend.unset-cap")
+T.expect("P10 spend: `cond ? Number(env.CAP) : Infinity` is an unlimited cap (FAIL)", s == "FAIL", out[-200:])
+s, out = st("check_spend.py", {"app/s.py": "import math\nimport anthropic\nclass Settings:\n    daily_cap_usd: float = math.inf\n"}, "spend.unset-cap")
+T.expect("P10 spend: a typed field defaulting to math.inf is an unlimited cap (FAIL)", s == "FAIL", out[-200:])
+s, out = st("check_spend.py", {"app/s.py": "import anthropic\n\"\"\"Never write DAILY_CAP_USD: float = float('inf') or float(os.environ.get('DAILY_CAP_USD', 'inf')).\"\"\"\nDAILY_CAP_USD = 0.0\n"}, "spend.unset-cap")
+T.expect("P10 spend: the same text inside a docstring is prose (PASS)", s == "PASS", out[-200:])
+s, out = st("check_spend.py", {"src/a.ts": "export function within(env, used) {\n  const limit = Number(env.LIMIT)\n  if (Number.isNaN(limit)) return true\n  return used < limit\n}\n" + _PAID10}, "spend.unset-cap")
+T.expect("P10 spend: `if (isNaN(limit)) return true` before `return used < limit` proceeds (FAIL)", s == "FAIL", out[-200:])
+s, out = st("check_spend.py", {"src/a.ts": "export function over(env, used) {\n  const limit = Number(env.LIMIT)\n  if (Number.isNaN(limit)) return true\n  return used >= limit\n}\n" + _PAID10}, "spend.unset-cap")
+T.expect("P10 spend: ...before `return used >= limit` (an over check) it refuses (PASS)", s == "PASS", out[-200:])
+# spend.per-client: a header the caller sets is not a client key; the connecting address is
+_PC = "const limiter = makeLimiter()\napp.post('/api/h', async (req, res) => {\n  const userId = %s\n  if (!(await limiter.check(userId))) return res.status(429).end()\n  res.json(await fetch('https://api.anthropic.com/v1/messages'))\n})\n"
+s, out = st("check_spend.py", dict(_FN, **{"src/s.js": _PC % "req.get('x-user-id')"}), "spend.per-client")
+T.expect("P10 spend: a limiter keyed on req.get('x-user-id') limits nothing (FAIL)", s == "FAIL", out[-200:])
+s, out = st("check_spend.py", dict(_FN, **{"src/s.js": _PC % "req.get('cf-connecting-ip')"}), "spend.per-client")
+T.expect("P10 spend: ...keyed on req.get('cf-connecting-ip') it is per client (PASS)", s == "PASS", out[-200:])
+# spend.llm-params: wrappers, Next req.json(), schema copies judged by their schema, Python kwargs
+s, out = st("check_spend.py", {"src/i.ts": "app.post('/c', async (c) => {\n  const body = await c.req.json()\n  return fetch('https://api.anthropic.com/v1/messages', { body: JSON.stringify({ max_tokens: Number(body.maxTokens) }) })\n})\n"}, "spend.llm-params")
+T.expect("P10 spend: max_tokens: Number(body.maxTokens) is caller-set (FAIL)", s == "FAIL", out[-200:])
+_ZOD = "import { z } from 'zod'\nconst Req = z.object({ model: %s, max_tokens: %s })\napp.post('/c', async (c) => {\n  const input = Req.parse(await c.req.json())\n  return fetch('https://api.openai.com/v1/chat/completions', { body: JSON.stringify({ model: input.model, max_tokens: input.max_tokens }) })\n})\n"
+s, out = st("check_spend.py", {"src/i.ts": _ZOD % ("z.string()", "z.number()")}, "spend.llm-params")
+T.expect("P10 spend: a schema copy with an open model string is caller-set (FAIL)", s == "FAIL", out[-200:])
+s, out = st("check_spend.py", {"src/i.ts": _ZOD % ("z.enum(['gpt-4o-mini'])", "z.number().int().max(1024)")}, "spend.llm-params")
+T.expect("P10 spend: ...with z.enum and .max(1024) the server chose (PASS)", s == "PASS", out[-200:])
+s, out = st("check_spend.py", {"app/m.py": "import anthropic\nclient = anthropic.Anthropic()\nasync def chat(req):\n    body = await req.json()\n    return client.messages.create(model=body['model'], max_tokens=400)\n"}, "spend.llm-params")
+T.expect("P10 spend: Python model=body['model'] is caller-set (FAIL)", s == "FAIL", out[-200:])
+s, out = st("check_spend.py", {"app/m.py": "import anthropic\nclient = anthropic.Anthropic()\nasync def chat(req):\n    body = await req.json()\n    return client.messages.create(model='claude-haiku-4-5', max_tokens=400, messages=body['messages'])\n"}, "spend.llm-params")
+T.expect("P10 spend: ...a fixed Python model is PASS", s == "PASS", out[-200:])
+# spend.open-proxy: namespace and path-alias imports of the forwarding helper (walk.import_bindings)
+_GEO = "export async function rev(lat: string, lng: string) {\n  %sconst r = await fetch(`https://maps.googleapis.com/maps/api/geocode/json?latlng=${lat},${lng}`)\n  return r.json()\n}\n"
+_NS = "import * as geo from './geo'\napp.get('/api/rev', async (c) => c.json(await geo.rev(c.req.query('lat') ?? '', c.req.query('lng') ?? '')))\n"
+s, out = st("check_spend.py", {"wrangler.toml": 'name = "w"\n', "src/geo.ts": _GEO % "", "src/index.ts": _NS}, "spend.open-proxy")
+T.expect("P10 spend: geo.rev(query) through `import * as geo` is an open proxy (FAIL)", s == "FAIL", out[-200:])
+s, out = st("check_spend.py", {"wrangler.toml": 'name = "w"\n', "src/geo.ts": _GEO % "if (!inBounds(lat, lng)) throw new Error('outside')\n  ", "src/index.ts": _NS}, "spend.open-proxy")
+T.expect("P10 spend: ...with a bounds check in the helper it is PASS", s == "PASS", out[-200:])
+s, out = st("check_spend.py", {"package.json": json.dumps({"dependencies": {"next": "16.0.1"}}), "lib/geo.ts": _GEO % "",
+                               "app/api/rev/route.ts": "import { rev } from '@/lib/geo'\nexport async function GET(req) {\n  const lat = req.nextUrl.searchParams.get('lat') ?? ''\n  return Response.json(await rev(lat, '0'))\n}\n"}, "spend.open-proxy")
+T.expect("P10 spend: a helper imported through the @/ alias is followed (FAIL)", s == "FAIL", out[-200:])
+s, out = st("check_spend.py", {"wrangler.toml": 'name = "w"\n', "src/geo.ts": _GEO % "if (!Number.isFinite(Number(lat))) throw new Error('bad')\n  ", "src/index.ts": _NS}, "spend.open-proxy")
+T.expect("P10 spend: an isFinite number check is not an area bound (FAIL)", s == "FAIL", out[-200:])
+
+# meter: a called helper is judged by its body; SQL drivers; routes behind middleware; binding aliases and parameters
+_KV = "export async function %s(env) {\n  const key = `ai:count:${day}`\n  const n = Number(await env.USAGE.get(key)) || 0\n  if (n >= 300) return false\n  await env.USAGE.put(key, String(n + 1))\n  return true\n}\n"
+_RT = "import { %s } from './g'\napp.post('/api/t', async (c) => {\n  if (!(await %s(c.env))) return c.json({}, 429)\n  return c.json(await fetch('https://api.openai.com/v1/chat/completions'))\n})\n"
+r, out = mt({"wrangler.toml": RL, "src/g.ts": _KV % "allowCall", "src/index.ts": _RT % ("allowCall", "allowCall")}, "meter.openai")
+T.expect("P10 meter: a helper of any name whose body reserves a day-keyed KV count is a counter (PASS)", r.get("status") == "PASS", out[-300:])
+r, out = mt({"wrangler.toml": RL, "src/g.ts": "export async function reserveSeat(env) { await env.DB.prepare('UPDATE seats SET held = 1').run() }\n", "src/index.ts": _RT % ("reserveSeat", "reserveSeat")}, "meter.openai")
+T.expect("P10 meter: a helper named reserve* whose body touches no counter is not one (FAIL)", r.get("status") == "FAIL", out[-300:])
+r, out = mt({"requirements.txt": "fastapi\n", "app/m.py": "import httpx\n\nasync def s(db):\n    n = await db.fetchval('UPDATE llm_usage SET calls = calls + 1 WHERE day = current_date RETURNING calls')\n    if n > 400:\n        raise RuntimeError('cap')\n    return httpx.post('https://api.openai.com/v1/chat/completions')\n"}, "meter.openai")
+T.expect("P10 meter: an UPDATE of a usage row through any SQL driver before the call is a counter (PASS)", r.get("status") == "PASS", out[-300:])
+r, out = mt({"requirements.txt": "fastapi\n", "app/m.py": "import httpx\n\nasync def s(db):\n    await db.fetchval('UPDATE profiles SET seen = now()')\n    return httpx.post('https://api.openai.com/v1/chat/completions')\n"}, "meter.openai")
+T.expect("P10 meter: ...an UPDATE of an unrelated row is not (FAIL)", r.get("status") == "FAIL", out[-300:])
+_MW = "import { reserveAiCall } from './g'\napp.post('/api/t', requireAuth, zValidator('json', z.object({ p: z.string() })), async (c) => {\n  %s\n  return c.json(await fetch('https://api.openai.com/v1/chat/completions'))\n})\n"
+r, out = mt({"wrangler.toml": RL, "src/g.ts": _KV % "reserveAiCall", "src/index.ts": _MW % "if (!(await reserveAiCall(c.env))) return c.json({}, 429)"}, "meter.openai")
+T.expect("P10 meter: a route behind middleware arguments is a function with its reservation (PASS)", r.get("status") == "PASS", out[-300:])
+r, out = mt({"wrangler.toml": RL, "src/g.ts": _KV % "reserveAiCall", "src/index.ts": _MW % "const x = 1"}, "meter.openai")
+T.expect("P10 meter: ...the same route without one is FAIL", r.get("status") == "FAIL", out[-300:])
+_BRT = "app.post('/api/t', async (c) => {\n  %s\n  return c.json(await fetch('https://api.openai.com/v1/chat/completions'))\n})\n"
+r, out = mt({"wrangler.toml": RL, "src/index.ts": _BRT % "const limiter = c.env.AI_LIMITER\n  const { success } = await limiter.limit({ key: 'k' })"}, "meter.ratelimit-binding")
+T.expect("P10 meter: an alias of the binding calling .limit() is a call (PASS)", r.get("status") == "PASS", out[-300:])
+r, out = mt({"wrangler.toml": RL, "src/rl.ts": "export async function perIp(binding, c) { return (await binding.limit({ key: 'k' })).success }\n", "src/index.ts": "import { perIp } from './rl'\n" + _BRT % "await perIp(c.env.AI_LIMITER, c)"}, "meter.ratelimit-binding")
+T.expect("P10 meter: the binding passed to a helper that calls .limit() on that parameter is a call (PASS)", r.get("status") == "PASS", out[-300:])
+r, out = mt({"wrangler.toml": RL, "src/rl.ts": "export async function perIp(binding, c) { return true }\n", "src/index.ts": "import { perIp } from './rl'\n" + _BRT % "await perIp(c.env.AI_LIMITER, c)"}, "meter.ratelimit-binding")
+T.expect("P10 meter: ...a helper that never calls .limit() on it is not (FAIL)", r.get("status") == "FAIL", out[-300:])
+# ---- end Phase 10 app-spend ----
+
+# ---- Phase 10 audit fixes ----
+# One FAIL and one PASS per mechanism the Phase 10 audit fixes add (check_app.sql_revokes, check_fetch
+# implements_guard and same-value guard calls, surface.secret_env, the typed c.req.json<T>() accessor).
+_hx = lambda src: {"src/index.ts": "import { Hono } from 'hono'\nconst app = new Hono()\n" + src + "\nexport default app\n"}
+# sign-out: a revocation column is judged by its word segments; a timestamp revokes nothing
+s, out = app8(_hx("app.post('/auth/logout', async (c) => {\n  await c.env.DB.prepare('UPDATE members SET last_token_seen_at = CURRENT_TIMESTAMP WHERE id = ?').bind(1).run()\n  c.header('Set-Cookie', 'm=; Max-Age=0')\n  return c.json({})\n})"), "app.signout")
+T.expect("P10 audit: a sign-out that only stamps last_token_seen_at revokes nothing (FAIL)", s == "FAIL", out[-300:])
+s, out = app8(_hx("app.post('/auth/logout', async (c) => {\n  await c.env.DB.prepare('UPDATE members SET session_generation = session_generation + 1 WHERE id = ?').bind(1).run()\n  return c.json({})\n})"), "app.signout")
+T.expect("P10 audit: ...bumping session_generation does (PASS)", s == "PASS", out[-300:])
+# env names by word segments: a flag holding AUTH or ADMIN as a substring is not a shared secret
+s, out = app8(_hx("app.patch('/api/pages/:id', async (c) => {\n  if (!c.env.ALLOW_ADMINISTRATION_TOOLS) return c.json({}, 403)\n  await c.env.DB.prepare('UPDATE pages SET t = 1 WHERE id = ?').bind(c.req.param('id')).run()\n  return c.json({})\n})"), "app.object-writes")
+T.expect("P10 audit: a 403 on env.ALLOW_ADMINISTRATION_TOOLS is a feature flag, not a gate (FAIL)", s == "FAIL", out[-300:])
+s, out = app8(_hx("app.patch('/api/pages/:id', async (c) => {\n  if (c.req.query('k') !== c.env.EDITOR_API_KEY) return c.json({}, 403)\n  await c.env.DB.prepare('UPDATE pages SET t = 1 WHERE id = ?').bind(c.req.param('id')).run()\n  return c.json({})\n})"), "app.object-writes")
+T.expect("P10 audit: ...a 403 against env.EDITOR_API_KEY is a shared-secret gate (PASS)", s == "PASS", out[-300:])
+# Hono's typed c.req.json<T>() is caller input
+s, out = app8(_hx("app.patch('/api/pages/:id', async (c) => {\n  const form = await c.req.json<{ account: string }>()\n  if (!form.account) return c.json({}, 401)\n  await c.env.DB.prepare('UPDATE pages SET t = 1 WHERE id = ?').bind(c.req.param('id')).run()\n  return c.json({})\n})"), "app.object-writes")
+T.expect("P10 audit: a 401 on a field of c.req.json<T>() is the caller's own data (FAIL)", s == "FAIL", out[-300:])
+s, out = app8(_hx("app.patch('/api/pages/:id', async (c) => {\n  const form = await c.req.json<{ t: string }>()\n  const acct = c.var.acct\n  if (!acct) return c.json({}, 401)\n  await c.env.DB.prepare('UPDATE pages SET t = ? WHERE id = ?').bind(form.t, c.req.param('id')).run()\n  return c.json({})\n})"), "app.object-writes")
+T.expect("P10 audit: ...a 401 on c.var.acct beside a typed body read is a gate (PASS)", s == "PASS", out[-300:])
+s, out = f10({"src/index.ts": "import { Hono } from 'hono'\nconst app = new Hono()\napp.post('/api/peek', async (c) => {\n  const { page: where } = await c.req.json<{ page: string }>()\n  return c.json({ s: (await fetch(where)).status })\n})\nexport default app\n"}, "fetch.request-url")
+T.expect("P10 audit: a URL destructured from c.req.json<T>() reaches fetch (FAIL)", s == "FAIL", out[-300:])
+s, out = f10({"src/index.ts": "import { Hono } from 'hono'\nconst app = new Hono()\nconst SITES = { a: 'https://a.example.org/' }\napp.post('/api/peek', async (c) => {\n  const { page } = await c.req.json<{ page: string }>()\n  return c.json({ s: (await fetch(SITES.a)).status, page })\n})\nexport default app\n"}, "fetch.request-url")
+T.expect("P10 audit: ...a fixed URL beside a typed body read is not caller-chosen (PASS)", s == "PASS", out[-300:])
+# guards: a string never counts, and a guard call counts only on the value fetched
+s, out = f10({"src/net.ts": _RESOLVING, "src/feeds.ts": "export async function pull(job: { feedUrl: string }) {\n  if (!job.feedUrl) throw new Error('ensurePublic(): no feed url given')\n  return (await fetch(job.feedUrl)).text()\n}\n"}, "fetch.data-url")
+T.expect("P10 audit: a guard name inside an error message guards nothing (FAIL)", s == "FAIL", out[-300:])
+s, out = f10({"src/net.ts": _RESOLVING, "src/feeds.ts": "import { ensurePublic } from './net'\nasync function vetted(raw: string) {\n  await ensurePublic(new URL(raw))\n  return raw\n}\nexport async function pull(job: { feedUrl: string, iconUrl: string }) {\n  await vetted(job.feedUrl)\n  return (await fetch(job.feedUrl)).text()\n}\n"}, "fetch.data-url")
+T.expect("P10 audit: ...a repo helper that calls the guard, called on the fetched value, is a check (PASS)", s == "PASS", out[-300:])
+s, out = f10({"src/net.ts": _RESOLVING, "src/feeds.ts": "import { ensurePublic } from './net'\nasync function vetted(raw: string) {\n  await ensurePublic(new URL(raw))\n  return raw\n}\nexport async function pull(job: { feedUrl: string, iconUrl: string }) {\n  await vetted(job.iconUrl)\n  return (await fetch(job.feedUrl)).text()\n}\n"}, "fetch.data-url")
+T.expect("P10 audit: ...the same helper called on a different value is not (FAIL)", s == "FAIL", out[-300:])
+# ---- end Phase 10 audit fixes ----
 
 T.finish()

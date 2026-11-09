@@ -74,6 +74,18 @@ BLOCK = [
     "node -e \"console.log(process.env.OPENAI_API_KEY)\"", "python3 -c 'import os; print(os.environ[\"MAPS_API_KEY\"])'",
     "echo hi && cat .dev.vars", "grep MAPS .dev.vars", "supabase status", "curl -H 'x-api-key: %s' https://x" % T.fake_key("anthropic"),
     "echo abc | npx wrangler pages secret put KEY",
+    "wrangler auth token", "npx wrangler auth token --json",
+    "cd ~/.wrangler/config && cat default.toml", "cd ~/Library/Preferences/.wrangler/config; grep oauth work.toml",
+    "cd ~/.wrangler/config && /bin/cat default.toml", "cd ~/.wrangler/config && command cat default.toml", "cd ~/.wrangler/config && env X=1 cat default.toml",
+    "cd ~/.wrangler/config && cut -d= -f2 default.toml", "cd ~/.wrangler/config && python3 -c \"print(open('default.toml').read())\"",
+    "cd ~/.wrangler/config && while read l; do echo $l; done < default.toml",
+    "cd ~/.wrangler/config && cd .. && cat config/default.toml", "cd ~/.wrangler/config && popd && cat default.toml",
+    "cd ~/.wrangler && cd /tmp && cd ~/.wrangler && cat config/default.toml", "cd ~/.wrangler; cd /; cd ~/.wrangler/config; cat default.toml", "cd /tmp && cd ~/.wrangler/config && cat default.toml", "cd ~/.wrangler/config && ls & cat default.toml", "cd ~/.wrangler/config && ls &cat default.toml",
+    "cd ~/.wrangler/config && ls && cat default.toml", "cd ~/.wrangler/config; ls; cat default.toml", "pushd ~/.wrangler/config && cat default.toml", "cd ~/.wrangler && cat config/default.toml",
+    "npx wrangler@latest auth token", "npx wrangler@3 auth token", "pnpm dlx wrangler@latest auth token", "bunx wrangler@4.1.0 auth token",
+    "echo abc | npx wrangler@latest pages secret put KEY", 'curl -H "Authorization: Bearer $(wrangler auth token)" https://api.cloudflare.com/client/v4/user',
+    "cat ~/.wrangler/config/default.toml", "grep oauth_token ~/.wrangler/config/work.toml", "less ~/Library/Preferences/.wrangler/config/default.toml",
+    "cat ~/.wrangler/config/*.toml",
 ]
 ALLOW = [
     "cut -d= -f1 .dev.vars", "cat .dev.vars | cut -d= -f1", "grep -c . .dev.vars", "grep -q '^MAPS_KEY=' .dev.vars && echo present",
@@ -82,6 +94,8 @@ ALLOW = [
     "[ -n \"$ANTHROPIC_API_KEY\" ] && echo set", "npx wrangler pages secret list", "pbpaste | npx wrangler pages secret put MAPS_KEY",
     "npm test", "env NODE_ENV=test npm test", "SECRET_GUARD_ALLOW=1 cat .dev.vars", "supabase status -o env | cut -d= -f1",
     "git status", "cat README.md",
+    "cd ~/.wrangler/config && ls -la", "cd ~/.wrangler && ls config", "cd ~/.wrangler && ls config; cd ~/proj; cat README.md", "cd ~/.wrangler/config && ls -la && pwd", "cd ~/.wrangler/config && cd .. && ls", "cd ~/.wrangler && cd && cat notes.txt", "cd ~/proj && cat README.md", "wrangler whoami", "wrangler whoami --cwd ~/.config/cf-profiles/work", "wrangler auth list", "wrangler auth activate work ~/.config/cf-profiles/work",
+    "ls -la ~/.wrangler/config/", "ls -la ~/.wrangler/config/default.toml", "cut -d= -f1 ~/.wrangler/config/work.toml", "grep -c . ~/.wrangler/config/default.toml",
 ]
 for cmd in BLOCK:
     rc, err = guard(cmd)
@@ -359,5 +373,64 @@ for label, body, cid, want in SHAPE:
     T.status_is("shape (%s)" % label, c, cid, want, out)
     val = body.split("=", 1)[1].strip()
     T.expect("shape (%s): value not printed" % label, len(val) < 8 or val not in out)
+
+# ---- Phase 10 secrets-ai ----
+# One FAIL and one PASS fixture per mechanism introduced in Phase 10; values built at run time, never printed.
+P10 = random.Random(1010)
+_r10 = lambda n: "Q" + "".join(P10.choice(_al) for _ in range(n - 3)) + "7z"
+NPM10 = "np" + "m_" + "".join(P10.choice(string.ascii_lowercase + string.digits) for _ in range(36))
+# config files committed by design: a secrets file only when a credential key holds a literal value
+for label, name, body, want in ((".envrc that only says use flake", ".envrc", "use flake\ndotenv_if_exists\n", "PASS"),
+                                (".envrc exporting a literal key", ".envrc", "export STRIPE_SECRET_KEY=%s\n" % _r10(30), "FAIL"),
+                                (".npmrc with an ${NPM_TOKEN} reference", ".npmrc", "//registry.npmjs.org/:_authToken=${NPM_TOKEN}\n", "PASS"),
+                                (".npmrc with a literal token", ".npmrc", "//registry.npmjs.org/:_authToken=%s\n" % NPM10, "FAIL"),
+                                ("secrets.yml with an ENV reference", "config/secrets.yml", "production:\n  secret_key_base: <%= ENV[\"SECRET_KEY_BASE\"] %>\n", "PASS"),
+                                ("appsettings with a connection-string password", "appsettings.Production.json", '{"Db": "Server=db;Password=%s;"}\n' % _r10(20), "FAIL"),
+                                (".netrc", ".netrc", "machine example.com login a password %s\n" % _r10(20), "FAIL"),
+                                ("suffixed deploy key id_rsa_ci", "deploy/id_rsa_ci", _pem, "FAIL"),
+                                ("the public half id_rsa_ci.pub", "deploy/id_rsa_ci.pub", "ssh-ed25519 AAAA%s ci\n" % _r10(40), "PASS")):
+    rp = T.git_init(T.tree({"app.py": "print('x')\n", name: body}))
+    rc, c, out = T.run(os.path.join(S, "check_secrets.py"), rp)
+    T.status_is("p10 tracked (%s)" % label, c, "secrets.tracked", want, out)
+    T.expect("p10 tracked (%s): value not printed" % label, not any(tok in out for tok in re.findall(r"[A-Za-z0-9_]{20,}", body)))
+# identifier-named generic hits: dismissed only for an identifier-shaped value under a name with no credential word
+for label, files, want in (("a random token under CACHE_KEY", {"src/c.ts": "const CACHE_KEY = '%s'\n" % _r10(40)}, "FAIL"),
+                           ("a hex value under CACHE_API_KEY", {"src/c.ts": "const CACHE_API_KEY = '%s'\n" % _hex64()}, "FAIL"),
+                           ("a hex value under CACHE_KEY", {"src/c.ts": "const CACHE_KEY = '%s'\n" % _hex64()}, "PASS")):
+    rp = T.git_init(T.tree(dict({"package.json": "{}\n"}, **files)))
+    rc, c, out = T.run(os.path.join(S, "check_secrets.py"), rp)
+    T.status_is("p10 history (%s)" % label, c, "secrets.history", want, out)
+# allowlists: a block comment BEFORE the code on the same line; a gitleaks config TOML under another name
+AWS10 = "AK" + "IA" + "".join(P10.choice(string.ascii_uppercase + "234567") for _ in range(16))
+for label, files, want in (("/* gitleaks:allow */ before the code", {"src/a.ts": "/* gitleaks:allow */ export const k = '%s'\n" % AWS10}, "FAIL"),
+                           ("a block comment alone on its line", {"src/a.ts": "/* gitleaks:allow */\nexport const n = 1\n"}, "PASS"),
+                           ("gitleaks.toml (no dot) with an allowlist", {"gitleaks.toml": "[extend]\nuseDefault = true\n[allowlist]\npaths = ['src/.*']\n"}, "FAIL"),
+                           ("pyproject [tool.x.allowlist] is not a gitleaks config", {"pyproject.toml": "[tool.lint]\nx = 1\n[tool.lint.allowlist]\nnames = ['a']\n"}, "PASS")):
+    rp = T.git_init(T.tree(dict({"README.md": "# x\n"}, **files)))
+    rc, c, out = T.run(os.path.join(S, "check_secrets.py"), rp)
+    T.status_is("p10 allowlist (%s)" % label, c, "secrets.allowlist", want, out)
+# check_secret_shape: placeholder words compared without separators; names read by words; x-filled bodies after a fixed head
+GK10 = T.fake_key("google", 1010)
+for label, body, cid, want in (("change-me under DB_PASS", "DB_PASS=change-me\n", "shape.DB_PASS", "FAIL"),
+                               ("a real-looking password under DB_PASS", "DB_PASS=%s\n" % _r10(24), "shape.DB_PASS", "PASS"),
+                               ("AUTH_MODE=test is a setting", "AUTH_MODE=test\n", "shape.AUTH_MODE", "PASS"),
+                               ("AUTH_TOKEN=test is a placeholder", "AUTH_TOKEN=test\n", "shape.AUTH_TOKEN", "FAIL"),
+                               ("ANTHROPIC_BASE_URL is a URL, not a key", "ANTHROPIC_BASE_URL=https://gw.example.com/a\n", "shape.ANTHROPIC_BASE_URL", "PASS"),
+                               ("ANTHROPIC_API_KEY holding a URL", "ANTHROPIC_API_KEY=https://gw.example.com/a\n", "shape.ANTHROPIC_API_KEY", "FAIL"),
+                               ("AIzaSy then x's", "GOOGLE_MAPS_API_KEY=AIzaSy%s\n" % ("X" * 33), "shape.GOOGLE_MAPS_API_KEY", "FAIL"),
+                               ("a real-shaped AIza key", "GOOGLE_MAPS_API_KEY=%s\n" % GK10, "shape.GOOGLE_MAPS_API_KEY", "PASS"),
+                               ("NAME= pasted with nothing after", "MY_SVC_API_TOKEN=MY_SVC_API_TOKEN=\n", "shape.MY_SVC_API_TOKEN", "FAIL")):
+    d10 = T.tree({".env": body})
+    rc, c, out = T.run(os.path.join(S, "check_secret_shape.py"), os.path.join(d10, ".env"))
+    T.status_is("p10 shape (%s)" % label, c, cid, want, out)
+# scan_captures: JSON string values are scanned decoded (an escaped closing quote no longer hides a key)
+ANT10 = "sk-" + "ant-api03-" + "".join(P10.choice(_al + "-_") for _ in range(93)) + "AA"
+for label, body, want in (("an Anthropic key before an escaped quote", _json.dumps({"content": "{\"ANTHROPIC_API_KEY\": \"%s\"}" % ANT10}) + "\n", 1),
+                          ("only a masked key", _json.dumps({"content": "{\"ANTHROPIC_API_KEY\": \"sk-ant-...4f2a\"}"}) + "\n", 0)):
+    d10 = T.tree({"raw/x.jsonl": body})
+    r = subprocess.run([sys.executable, os.path.join(S, "scan_captures.py"), d10], capture_output=True, text=True)
+    T.expect("p10 captures (%s): exit %d" % (label, want), r.returncode == want, r.stdout[-300:].replace(ANT10, "<KEY>"))
+    T.expect("p10 captures (%s): value not printed" % label, ANT10 not in r.stdout + r.stderr)
+# ---- end Phase 10 secrets-ai ----
 
 T.finish()

@@ -60,15 +60,17 @@ def detect_stack(repo):
         stack.add("nextjs")
     if "@opennextjs/cloudflare" in deps:
         stack.add("opennext")
-    if "@supabase/supabase-js" in deps or os.path.isdir(os.path.join(repo, "supabase")) or _nested_supabase(repo) or _python_supabase(repo):
+    if "@supabase/supabase-js" in deps or os.path.isdir(os.path.join(repo, "supabase")) or _nested_supabase(repo, depth=None) or _python_supabase(repo):
         stack.add("supabase")
     cf_files = walk.exists_any(repo, "wrangler.toml", "wrangler.jsonc", "wrangler.json", "_headers", "public/_headers", "functions")
     if cf_files or "wrangler" in deps:
         stack.add("cloudflare")
-    # A monorepo keeps one fly.toml or railway config per service folder: any depth, not only the root.
-    if walk.exists_any(repo, "fly.toml") or any(walk.files(repo, exts=("fly.toml",), tests=False)):
+    # A monorepo keeps one fly or railway config per service folder: any depth, not only the root, and
+    # whatever the folder is called (a load-test service under tests/ deploys too). Named fly configs
+    # (fly.production.toml, used with `fly deploy -c`) count. A sample under docs/ or examples/ does not.
+    if _deploy_configs(repo, FLY_CONFIG):
         stack.add("fly")
-    if walk.exists_any(repo, "railway.json", "railway.toml") or any(walk.files(repo, exts=("railway.json", "railway.toml"), tests=False)):
+    if _deploy_configs(repo, RAILWAY_CONFIG):
         stack.add("railway")
     if walk.exists_any(repo, "appsscript.json", ".clasp.json") or list(walk.files(repo, exts=("appsscript.json",))):
         stack.add("google-apps-script")
@@ -79,18 +81,35 @@ def detect_stack(repo):
     return sorted(stack), deps
 
 
+FLY_CONFIG = re.compile(r"^fly(?:\.[\w-]+)?\.toml$")
+RAILWAY_CONFIG = re.compile(r"^railway\.(?:json|toml)$")
+# Documentation and sample folders: a config there illustrates, it does not deploy.
+SAMPLE_PATH = re.compile(r"(^|/)(docs?|examples?|samples?|fixtures?|__fixtures__)/")
+
+
+def _deploy_configs(repo, name_rx):
+    """Repo-relative paths of deploy configs named like name_rx, at any depth, outside sample folders."""
+    out = []
+    for p in walk.files(repo, exts=(), tests=True):
+        r = walk.rel(repo, p)
+        if name_rx.match(os.path.basename(p)) and not SAMPLE_PATH.search(r):
+            out.append(r)
+    return out
+
+
 def _nested_supabase(repo, depth=2):
-    """A supabase/ project folder (config.toml, migrations/ or functions/) up to `depth` levels down."""
+    """A supabase/ project folder (config.toml, migrations/ or functions/) up to `depth` levels down
+    (depth None: any depth), outside documentation and sample folders."""
     base = os.path.abspath(repo)
     for root, dirs, names in os.walk(base):
         rel = os.path.relpath(root, base)
         level = 0 if rel == "." else rel.count(os.sep) + 1  # the folder that CONTAINS supabase/
         dirs[:] = [d for d in dirs if d not in walk.SKIP_DIRS and not d.startswith(".")]
-        if "supabase" in dirs and level >= 1:
+        if "supabase" in dirs and level >= 1 and not SAMPLE_PATH.search(walk.rel(base, os.path.join(root, "supabase")) + "/"):
             sd = os.path.join(root, "supabase")
             if os.path.isfile(os.path.join(sd, "config.toml")) or any(os.path.isdir(os.path.join(sd, m)) for m in ("migrations", "functions")):
                 return True
-        if level >= depth:
+        if depth is not None and level >= depth:
             dirs[:] = []
     return False
 

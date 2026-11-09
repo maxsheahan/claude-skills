@@ -21,6 +21,9 @@ cannot see env vars set inline on the command it gates, found 2026-06-13).
 2026-11-01: five false blocks in one day (prose naming a secrets file inside a
 heredoc, a filtered os.environ copy, a grep pattern containing env, the prefix
 after a cd) made the guard judge sinks and read primitives, not words.
+2026-11-07: wrangler's credential store (~/.wrangler/config/<profile>.toml) and
+`wrangler auth token` both passed unseen while a Cloudflare login skill was
+graded; the store is a secrets file now and the token print is refused like gh's.
 """
 import json
 import re
@@ -29,7 +32,7 @@ import sys
 SECRETISH = r"[A-Za-z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|PASSCODE|PRIVATE|CREDENTIAL|DSN|SALT|PAT|_URL|DATABASE|CONN)[A-Za-z0-9_]*"
 SAFE_VAR_SUFFIX = re.compile(r"_(?:COUNT|LEN|LENGTH|SET|PATH|FILE|DIR|NAME|NAMES|ID)$")
 # Any token that names a secrets file, including globs (.dev*, .env*, .dev.var?).
-SECRET_FILE_TOKEN = re.compile(r"""(?:^|[\s'"=<>|;&(:/])(?:\.dev\.vars|\.dev[*?\[]|\.dev\.var[*?\[]|\.env(?:\.(?!example\b|sample\b|template\b)[\w*?\[\]-]+|[*?\[])?|[\w.*?-]*\.pem|id_rsa|id_ed25519|credentials\.json|service-account[\w.*?-]*\.json|\.netrc|\.npmrc|hosts\.yml)(?=$|[\s'"|;&<>)])""")
+SECRET_FILE_TOKEN = re.compile(r"""(?:^|[\s'"=<>|;&(:/])(?:\.dev\.vars|\.dev[*?\[]|\.dev\.var[*?\[]|\.env(?:\.(?!example\b|sample\b|template\b)[\w*?\[\]-]+|[*?\[])?|[\w.*?-]*\.pem|id_rsa|id_ed25519|credentials\.json|service-account[\w.*?-]*\.json|\.netrc|\.npmrc|hosts\.yml|\.wrangler/config/[\w.*?\[\]-]+)(?=$|[\s'"|;&<>)])""")
 # The only forms allowed to name a secrets file: they show names, counts or presence, or load it into a process.
 ALLOWED_WITH_SECRET_FILE = [
     re.compile(r"""^cut\s+-d\s*['"]?=['"]?\s+-f\s*1\s+\S+$"""),                          # cut -d= -f1 FILE (exactly field 1)
@@ -38,7 +41,7 @@ ALLOWED_WITH_SECRET_FILE = [
     re.compile(r"""^sed\s+-E?\s*['"]s/=\.\*//['"]\s+\S+$"""),
     re.compile(r"""^grep\s+-[a-zA-Z]*[cqlL][a-zA-Z]*\s+(?:-[a-zA-Z]+\s+)*(?:'[^']*'|"[^"]*"|\S+)\s+\S+$"""),  # grep -c/-q/-l PATTERN FILE
     re.compile(r"""^wc(?:\s+-[lcw]+)?\s+\S+$"""),
-    re.compile(r"""^(?:ls|stat|file)(?:\s+-[a-zA-Z]+)*(?:\s+[\w./-]+)+$"""),
+    re.compile(r"""^(?:ls|stat|file)(?:\s+-[a-zA-Z]+)*(?:\s+[\w./~-]+)+$"""),
     re.compile(r"""^(?:test|\[)\s+-[efsr]\s+\S+(?:\s+\])?$"""),
     re.compile(r"""^git\s+(?:check-ignore|ls-files|rm\s+--cached)(?:\s+-[-a-zA-Z]+)*(?:\s+[\w./-]+)+$"""),
     re.compile(r"""^chmod\s+\d+\s+\S+$"""),
@@ -72,13 +75,53 @@ OTHER_RULES = [
      "`railway variables --kv | cut -d= -f1` for names, `railway variables --kv | grep -c .` for a count"),
     ("GitHub token", re.compile(r"\bgh\s+auth\s+(?:token|status\b[^|;&]*(?:-t\b|--show-token))"),
      "`gh auth status` (without -t) shows the account and scopes without the token"),
+    # Any runner prefix (npx, pnpm dlx, bunx) and any version pin (wrangler@latest, @3) still names wrangler (Claude review, PR #8).
+    ("Wrangler OAuth token", re.compile(r"\bwrangler(?:@[\w.^~-]+)?\s+auth\s+token\b"),
+     "`wrangler whoami` shows the login, accounts and scopes without the token; route the command with `--profile` and `CLOUDFLARE_ACCOUNT_ID` instead of extracting it (the OAuth token is not reusable for direct API calls anyway)"),
     ("cloud token print", re.compile(r"\bgcloud\s+auth\s+(?:application-default\s+)?print-(?:access|identity)-token\b|\baws\s+configure\s+get\s+\S*secret|\bsecurity\s+find-(?:generic|internet)-password\b[^|;&]*\s-[wg]\b|\bop\s+read\b|\bpass\s+show\b"),
      "pipe the token straight into the command that needs it (`$(gcloud auth print-access-token)` inside a curl), never to the terminal"),
-    ("Wrangler secret value", re.compile(r"\b(?:echo|printf)\b[^|]*\|\s*(?:npx\s+)?wrangler\s+(?:pages\s+)?secret\s+put\b"),
+    ("Wrangler secret value", re.compile(r"\b(?:echo|printf)\b[^|]*\|\s*(?:(?:npx|bunx|pnpm\s+dlx|yarn\s+dlx)\s+(?:--yes\s+|-y\s+)?)?wrangler(?:@[\w.^~-]+)?\s+(?:pages\s+)?secret\s+put\b"),
      "pipe from the clipboard or a file without echoing: `pbpaste | npx wrangler pages secret put NAME` (secret-handling skill)"),
     ("Supabase keys", re.compile(r"\bsupabase\s+status\b"),
      "`supabase status -o env | cut -d= -f1` for names"),
 ]
+# Changing into wrangler's folder (cd or pushd, ~/.wrangler or deeper) lets any command read the store by a bare
+# name. A list of reader names is never complete (/bin/cat, command cat, cut, python -c, a while-read loop all
+# slipped past one; Claude reviews, PR #8), so this is an allowlist: after the cd, only listing commands may run
+# until the command changes directory again. Judged on the whole command.
+WRANGLER_CD = re.compile(r"""(?:^|&&|;|\|\||\()\s*(?:cd|pushd)\s+["']?[^;&|"']*\.wrangler\b""")
+WRANGLER_LISTING = re.compile(r"""^(?:ls|stat|file|pwd|du|true)(?:\s+[^<>`$&;|()]*)?$""")
+# Only a cd to a home or absolute path outside .wrangler (or a bare cd) leaves the folder; a relative cd, or a
+# popd to wherever the stack pointed, may stay inside, so it is treated as still inside.
+WRANGLER_LEAVE = re.compile(r"""^(?:cd\s*$|(?:cd|pushd)\s+["']?(?:~/?|/)(?![^;&|"']*\.wrangler)[^;&|]*$)""")
+WRANGLER_STAY = re.compile(r"""^(?:cd|pushd)\s+["']?(?!~|/)[^;&|]*$""")
+
+
+def _wrangler_cd_read(cmd):
+    """True when, at any point inside a .wrangler folder, a command other than listing runs. Every segment is
+    walked, so leaving and re-entering (a decoy first cd) is caught too (Claude review, PR #8)."""
+    if not WRANGLER_CD.search(cmd):
+        return False
+    inside = False
+    for part in re.split(r"&&|\|\||;|\||&|\n|\(|\)", cmd):  # a lone & (background) separates commands too
+        seg = part.strip()
+        if not seg:
+            continue
+        if re.match(r"""(?:cd|pushd)\s+["']?[^;&|"']*\.wrangler\b""", seg):
+            inside = True
+            continue
+        if not inside:
+            continue
+        if WRANGLER_LEAVE.match(seg):
+            inside = False
+            continue
+        if WRANGLER_STAY.match(seg) or seg == "popd":
+            continue  # a relative cd or popd may stay inside, so the folder still counts as entered
+        if not WRANGLER_LISTING.match(seg):
+            return True
+    return False
+
+
 ALLOWED_OTHER = [
     re.compile(r"""^railway\s+(?:variables|vars)\s+--kv\s*\|\s*""" + NAMES_OR_COUNT + r"""\s*$"""),
     re.compile(r"""^supabase\s+status\s+-o\s+env\s*\|\s*""" + NAMES_OR_COUNT + r"""\s*$"""),
@@ -240,6 +283,8 @@ def check(cmd):
     for s in SHAPES:
         if re.search(s, cmd):
             return ("contains a credential-shaped value", "never paste a key into a command; read it from the clipboard or a file inside the command (secret-handling skill)")
+    if _wrangler_cd_read(cmd):
+        return ("reads wrangler's credential store after a cd", "`ls -la ~/.wrangler/config/` names the profiles; `wrangler whoami` shows the login without reading the file")
     if re.search(r"\bgit\s+(?:show|log\s+[^|;&]*-p|diff|blame|cat-file|grep)\b[^|;&]*(?:\.dev\.vars|\.env\b|\.pem)", cmd):
         return ("prints a secrets file from git history", HINT_FILE)
     for payload in _interpreter_payloads(typed):

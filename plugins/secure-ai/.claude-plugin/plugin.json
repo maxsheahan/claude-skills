@@ -1,6 +1,6 @@
 {
   "name": "secure-ai",
-  "version": "0.5.5",
+  "version": "0.6.1",
   "author": { "name": "Max Sheahan" },
   "description": "AI-feature security for your builds: static checks for how an app feeds and trusts a model (a model key in browser code, caller input in the system prompt, secrets inside prompt text, model output reaching raw HTML, eval, a shell or string-built SQL, Markdown that can load attacker images, tools that fetch a URL the model chose), and a red-team probe that sends twelve prompt-injection probes to a LOCAL dev server and grades the replies by canary and markup, with no model in the grading. Requires secure-core."
 }

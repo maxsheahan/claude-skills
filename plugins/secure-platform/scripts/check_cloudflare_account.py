@@ -12,7 +12,8 @@ Per zone (cfacct.<check>.<zone>):
   ssl       `strict` (Full strict), else FAIL medium: Full accepts an unvalidated origin certificate.
   tls       min_tls_version >= 1.2, else FAIL low.
   https     always_use_https on, else FAIL medium: plain http serves the site.
-  hsts      HSTS enabled with a max_age above 0 on zones that serve content, else FAIL
+  hsts      HSTS enabled with a max_age of at least 15552000 (6 months, the repo-side minimum;
+            a numeric string is read as its number) on zones that serve content, else FAIL
             low (enabled with max_age 0 tells browsers to forget HSTS); a zone with
             zero DNS records serves nothing and is reported as PASS with an info detail.
   dnssec    status active, else FAIL low.
@@ -27,7 +28,9 @@ Account-wide:
   cfacct.kv-orphans         KV namespaces bound by no Worker and no Pages project: FAIL info.
   cfacct.workers-dev-exposed  a Worker with workers.dev enabled, no route or custom domain, and
                             a data binding (D1, KV, R2, Hyperdrive, Vectorize, a queue, a secret,
-                            a Durable Object) FAILs medium (zone rules cannot reach it).
+                            a Secrets Store secret, a Durable Object, a plain_text var named or
+                            shaped like a credential, or a service binding to a Worker holding
+                            any of these) FAILs medium (zone rules cannot reach it).
 Every check whose data a call could not read (9109 / 10000) is UNKNOWN naming the permission.
 
 Snapshot shape (the same objects the API returns, grouped):
@@ -50,6 +53,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _corepath  # noqa: F401,E402
 import ledger  # noqa: E402
 from ledger import result  # noqa: E402
+from names import secret_name  # noqa: E402  (a plain_text binding named like a credential is a secret in the clear)
 
 API = "https://api.cloudflare.com/client/v4"
 AUTH_CODES = (9109, 10000)
@@ -69,7 +73,29 @@ PERMISSION = {
     "worker_settings": "Workers Scripts: Read",
     "worker_domains": "Workers Scripts: Read",
 }
-DATA_BINDINGS = {"d1", "kv_namespace", "r2_bucket", "secret_text", "durable_object_namespace", "hyperdrive", "vectorize", "queue"}
+# The same minimum as the repo-side cf.headers.hsts check (Phase 10: max_age 300 passed here, failed there).
+HSTS_MIN_AGE = 15552000
+
+
+def _max_age(v):
+    """max_age as a number: the API returns an int, a snapshot writer may store "15552000"."""
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        return v
+    if isinstance(v, str) and v.strip().isdigit():
+        return int(v.strip())
+    return None
+
+
+DATA_BINDINGS = {"d1", "kv_namespace", "r2_bucket", "secret_text", "durable_object_namespace", "hyperdrive", "vectorize", "queue",
+                 "secrets_store_secret"}
+
+
+def allowed_base(base):
+    """The token only ever goes to Cloudflare or a local test server: never another host, never file://."""
+    b = base.rstrip("/")
+    return b == API.rstrip("/") or re.match(r"^http://127\.0\.0\.1:\d+(/|$)", b) is not None
 
 
 class Api:
@@ -89,7 +115,8 @@ class Api:
                 url += ("&" if "?" in url else "?") + "page=%d&per_page=50" % page
             req = urllib.request.Request(url, headers={"Authorization": "Bearer %s" % self.token, "Accept": "application/json"})
             try:
-                with urllib.request.urlopen(req, timeout=30) as r:
+                        # self.base passed allowed_base(): Cloudflare's own https host or a 127.0.0.1 test server.
+                with urllib.request.urlopen(req, timeout=30) as r:  # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
                     data = json.loads(r.read().decode("utf-8", "replace"))
             except urllib.error.HTTPError as e:
                 try:
@@ -221,8 +248,10 @@ def judge(snap):
             if recs is not None and len(recs) == 0:
                 res.append(result("cfacct.hsts.%s" % zs, "%s: HSTS is on" % zname, "PASS", "zone has 0 DNS records: nothing is served, HSTS not judged",
                                   detail="info: an empty zone; revisit when a record is added"))
-            elif hsts.get("enabled") is True and hsts.get("max_age") is not None and not (isinstance(hsts.get("max_age"), (int, float)) and hsts["max_age"] > 0):
-                res.append(result("cfacct.hsts.%s" % zs, "%s: HSTS is on" % zname, "FAIL", "GET /zones/%s/settings: security_header.strict_transport_security.enabled = true but max_age = %s (browsers forget HSTS at max-age 0)" % (zname, hsts.get("max_age")),
+            elif hsts.get("enabled") is True and hsts.get("max_age") is not None and not (_max_age(hsts["max_age"]) or 0) >= HSTS_MIN_AGE:
+                age = _max_age(hsts["max_age"])
+                why = "browsers forget HSTS at max-age 0" if not age else "under %d (6 months), the repo-side minimum: a browser that stays away that long is back on http" % HSTS_MIN_AGE
+                res.append(result("cfacct.hsts.%s" % zs, "%s: HSTS is on" % zname, "FAIL", "GET /zones/%s/settings: security_header.strict_transport_security.enabled = true but max_age = %s (%s)" % (zname, hsts.get("max_age"), why),
                                   severity="low", fix="set the HSTS max-age to 6 months (15552000) once every host on the zone answers https; max-age 0 is HSTS switched off"))
             elif hsts.get("enabled") is True:
                 res.append(result("cfacct.hsts.%s" % zs, "%s: HSTS is on" % zname, "PASS", "GET /zones/%s/settings: security_header.strict_transport_security.enabled = true, max_age = %s" % (zname, hsts.get("max_age", "not reported"))))
@@ -340,13 +369,38 @@ def judge(snap):
             if d.get("service"):
                 routed.add(d["service"])
         exposed, partial = [], []
+        # What each Worker holds: a data binding, a secret, a plain_text var whose name or value is a
+        # credential (names.secret_name: it is a secret stored in the clear), or a service binding to a
+        # Worker that holds data (reachable through this one). Followed to a fixed point (Phase 10).
+        holds = {}
+        for w in workers:
+            st = w.get("settings") or {}
+            kinds = set()
+            for b in (st.get("bindings") or []):
+                t = b.get("type")
+                if t in DATA_BINDINGS:
+                    kinds.add(t)
+                elif t == "plain_text" and secret_name(b.get("name") or "", b.get("text") if isinstance(b.get("text"), str) else None):
+                    kinds.add("plain_text secret %s" % b.get("name"))
+            holds[w.get("id")] = kinds
+        changed = True
+        while changed:
+            changed = False
+            for w in workers:
+                for b in ((w.get("settings") or {}).get("bindings") or []):
+                    target = b.get("service")
+                    if b.get("type") == "service" and holds.get(target) and target != w.get("id"):
+                        tag = "service %s" % target
+                        if tag not in holds[w.get("id")]:
+                            holds[w.get("id")].add(tag)
+                            changed = True
         for w in workers:
             name = w.get("id")
             sub, st = w.get("subdomain"), w.get("settings")
             if sub is None or st is None:
                 partial.append(name)
                 continue
-            kinds = sorted({b.get("type") for b in (st.get("bindings") or []) if b.get("type") in DATA_BINDINGS})
+            kinds = sorted(holds.get(name) or ())
             if sub.get("enabled") and name not in routed and kinds:
                 exposed.append("%s (%s)" % (name, ", ".join(kinds)))
         if exposed:
@@ -378,6 +432,9 @@ def main():
         if not token:
             return ledger.emit([result("cfacct.token", "Cloudflare account read", "UNKNOWN", "CLOUDFLARE_API_TOKEN unset and no --snapshot given",
                                       reason="no token: export CLOUDFLARE_API_TOKEN (read-only scopes) or pass --snapshot account.json")])
+        if not allowed_base(a.api_base):
+            print("refused: the API base must be %s or a http://127.0.0.1 test server" % API, file=sys.stderr)
+            return 2
         snap = fetch_snapshot(token, a.account, a.api_base)
         out = a.out or (tempfile.mkstemp(prefix="cf-account-", suffix=".json")[1] if a.mode == "fetch" else None)
         if out:

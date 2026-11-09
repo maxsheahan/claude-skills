@@ -83,7 +83,7 @@
       "name": "secure-core",
       "source": "./plugins/secure-core",
       "description": "The secure-launch front door: maps a repo's attack surface (routes, auth, outbound fetches, paid APIs and their spend caps, secrets by name, data stores, deploy targets), runs every applicable check in the suite, and writes one findings ledger where each check is PASS, FAIL or UNKNOWN. Required by every other secure-launch plugin.",
-      "version": "0.5.5",
+      "version": "0.6.1",
       "author": {
         "name": "Max Sheahan",
         "url": "https://maxsheahan.com"
@@ -100,7 +100,7 @@
       "name": "secure-secrets",
       "source": "./plugins/secure-secrets",
       "description": "Keep secret values out of repos and out of captured sessions: a gitleaks scan proven on planted keys, values never printed; a staged PreToolUse guard that blocks commands which print secrets; a capture-folder scanner; and a per-provider rotation runbook with a shape check that never displays the value. Requires secure-core.",
-      "version": "0.5.5",
+      "version": "0.6.1",
       "author": {
         "name": "Max Sheahan",
         "url": "https://maxsheahan.com"
@@ -117,7 +117,7 @@
       "name": "secure-supply-chain",
       "source": "./plugins/secure-supply-chain",
       "description": "Dependency risk without auto-bumps: production npm audit with per-advisory reachability triage recorded in the repo, lockfile presence, GitHub Actions pinned to SHAs with secrets scoped per step, wrangler pinned, and a check that the BUILT code resolves and loads under plain Node (vitest resolves differently). Requires secure-core.",
-      "version": "0.5.5",
+      "version": "0.6.1",
       "author": {
         "name": "Max Sheahan",
         "url": "https://maxsheahan.com"
@@ -134,7 +134,7 @@
       "name": "secure-app",
       "source": "./plugins/secure-app",
       "description": "App-layer security for your builds: ASVS-lite checks (credentialed CORS, stack traces in responses, debug routes, sign-out that only clears the browser, object writes without an ownership reference), outbound-fetch guard against SSRF, abuse and spend (uncapped paid APIs, unset caps that mean unlimited, open proxies, per-client ceilings, caller-set LLM params), auth gates that open on their own (a guard skipped when a secret is unset, identity from a bare header, Access trusted only at the edge, open better-auth sign-up), AI route metering (a daily counter reserved before every paid call, with a drop-in guard template), authorization inside MCP tools (every tool-reachable query scoped to the signed-in identity, no identity from tool arguments, privileged tools gated), and tests proven by removing each protection. Requires secure-core.",
-      "version": "0.5.5",
+      "version": "0.6.1",
       "author": {
         "name": "Max Sheahan",
         "url": "https://maxsheahan.com"
@@ -151,7 +151,7 @@
       "name": "secure-platform",
       "source": "./plugins/secure-platform",
       "description": "One adapter per supported platform, each stating what it checks and what it cannot see: Cloudflare Pages and Workers (headers on every path, no secrets in [vars], previews off production data, edge hardening), Next.js on OpenNext (server actions, NEXT_PUBLIC_ secrets, static-export headers), Fly and Supabase (RLS, service-role key, [env] secrets, exposed ports), Google Apps Script (web app access, scopes, keys in code), Railway (environment dumps, count-only variable reads), and the Cloudflare account itself through the API or a snapshot (zone SSL, TLS, HTTPS, HSTS, DNSSEC; dangling pages.dev CNAMEs; members without 2FA; preview secrets; orphan KV; data Workers exposed on workers.dev). Requires secure-core.",
-      "version": "0.5.5",
+      "version": "0.6.1",
       "author": {
         "name": "Max Sheahan",
         "url": "https://maxsheahan.com"
@@ -169,7 +169,7 @@
       "name": "secure-gate",
       "source": "./plugins/secure-gate",
       "description": "Enforce the secure-launch ledger: a gate that refuses on FAIL and on any UNKNOWN the owner has not accepted, and drop-in templates (GitHub Actions workflow, deploy-script gate, pre-push hook) vendored into a repo only on request. Requires secure-core.",
-      "version": "0.5.5",
+      "version": "0.6.1",
       "author": {
         "name": "Max Sheahan",
         "url": "https://maxsheahan.com"
@@ -186,7 +186,7 @@
       "name": "secure-ai",
       "source": "./plugins/secure-ai",
       "description": "AI-feature security for your builds: static checks for how an app feeds and trusts a model (a model key in browser code, caller input in the system prompt, secrets inside prompt text, model output reaching raw HTML, eval, a shell or string-built SQL, Markdown that can load attacker images, tools that fetch a URL the model chose), and a red-team probe that sends twelve prompt-injection probes to a LOCAL dev server and grades the replies by canary and markup, with no model in the grading. Requires secure-core.",
-      "version": "0.5.5",
+      "version": "0.6.1",
       "author": {
         "name": "Max Sheahan",
         "url": "https://maxsheahan.com"

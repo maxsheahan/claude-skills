@@ -21,7 +21,7 @@ import sys
 
 STATUSES = ("PASS", "FAIL", "UNKNOWN")
 SEVERITIES = ("critical", "high", "medium", "low", "info")
-SUITE_VERSION = "0.5.5"
+SUITE_VERSION = "0.6.1"
 
 # Values that look like credentials. Used to refuse writing them anywhere: a
 # check must report a location, never a value. Patterns match key SHAPES only.
@@ -73,19 +73,90 @@ def result(id, title, status, evidence, severity=None, fix=None, reason=None, de
     return r
 
 
-def git_state(repo):
-    """HEAD plus a fingerprint of the working tree, shared by the orchestrator and the gate.
-    Python bytecode is left out: running the vendored scripts writes __pycache__ inside a
-    committed .secure-launch/, which changed the status between ledger and gate on the first
-    real CI run (a coaching app's PR, 2026-10-09)."""
-    import hashlib
+_PYC_RX = re.compile(r"(^|/)__pycache__/[^/]+\.py[co]$")
+# Every GIT_* variable is dropped, not only the index and object ones: a hook exports GIT_DIR and
+# GIT_WORK_TREE, and under them `git -C repo` hashes the HOOK's repo with no error (audit 2026-11-07).
+
+
+def git_state(repo, exclude=()):
+    """HEAD plus a hash of the working tree's CONTENT, shared by the orchestrator and the gate.
+
+    The tree is hashed by staging every non-ignored file into a throwaway index (seeded from HEAD's
+    tree with no stat data, so every file is re-read) and running `git write-tree` on it, with new
+    objects written to a throwaway object directory that borrows the repo's store as an alternate.
+    The repo's own index, HEAD and object store are never written. The old fingerprint hashed
+    `git status --porcelain` lines and missed a file edited after the run whenever its status line
+    stayed the same (an untracked or already-modified file; Phase 10 audit F4, F5, F6).
+
+    Left out: git-ignored files (`git add -A` honors .gitignore and info/exclude); Python bytecode,
+    only paths matching `(^|/)__pycache__/<name>.pyc|.pyo` (running vendored scripts writes it inside a
+    committed .secure-launch/, which changed the tree between ledger and gate on the first real CI run,
+    a coaching app's PR, 2026-10-09); and the paths in `exclude`, meant for the ledger file itself,
+    which carries this binding and so cannot be part of what it hashes.
+
+    Returns None outside a git repo, and {"head", "status": None, "error"} when the tree could not be
+    hashed (the gate refuses that)."""
+    import shutil
     import subprocess
-    head = subprocess.run(["git", "-C", repo, "rev-parse", "HEAD"], capture_output=True, text=True)
+    import tempfile
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+
+    def git(where, *args, tenv=None, stdin=None):
+        return subprocess.run(["git", "-C", where] + list(args), capture_output=True, text=True,
+                              env=tenv or env, input=stdin)
+
+    def last(r):
+        return (r.stderr.strip().splitlines()[-1:] or [""])[0][:200]
+
+    head = git(repo, "rev-parse", "HEAD")
     if head.returncode != 0:
         return None
-    st = subprocess.run(["git", "-C", repo, "status", "--porcelain", "--untracked-files=all"], capture_output=True, text=True).stdout
-    kept = sorted(l for l in st.splitlines() if "__pycache__/" not in l and not l.endswith((".pyc", ".pyo")))
-    return {"head": head.stdout.strip(), "status": hashlib.sha1("\n".join(kept).encode()).hexdigest()[:12]}
+    state = {"head": head.stdout.strip(), "status": None}
+    top = git(repo, "rev-parse", "--show-toplevel").stdout.strip()
+    index = git(repo, "rev-parse", "--git-path", "index").stdout.strip()
+    objects = git(repo, "rev-parse", "--git-path", "objects").stdout.strip()
+    if not (top and index and objects):
+        state["error"] = "git rev-parse could not name the work tree, index or object store"
+        return state
+    index, objects = (os.path.normpath(os.path.join(repo, x)) for x in (index, objects))  # relative to -C repo
+    tmp = tempfile.mkdtemp(prefix="sl-gitstate-")
+    try:
+        tidx = os.path.join(tmp, "index")
+        os.makedirs(os.path.join(tmp, "objects"))
+        tenv = dict(env, GIT_INDEX_FILE=tidx, GIT_OBJECT_DIRECTORY=os.path.join(tmp, "objects"),
+                    GIT_ALTERNATE_OBJECT_DIRECTORIES=objects)
+        # The throwaway index starts from HEAD's tree with no cached stat data, so `git add -A` re-reads
+        # every file. A copy of the repo's index carried stat data that git trusted once the copy looked
+        # newer than the file: a same-size edit in the second of the last index write then passed the gate
+        # (audit case F3, about 1 run in 6 on 0.6.0, 2026-11-09).
+        seed = git(top, "read-tree", "HEAD", tenv=tenv)
+        if seed.returncode != 0:
+            state["error"] = "git read-tree into a throwaway index failed: %s" % last(seed)
+            return state
+        add = git(top, "add", "-A", "--", ".", tenv=tenv)
+        if add.returncode != 0:
+            state["error"] = "git add into a throwaway index failed: %s" % last(add)
+            return state
+        listed = set(p for p in git(top, "ls-files", "-z", "--cached", tenv=tenv).stdout.split("\0") if p)
+        real_top = os.path.realpath(top)
+        drop = {p for p in listed if _PYC_RX.search(p)}
+        for e in exclude or ():
+            rel = os.path.relpath(os.path.realpath(e), real_top).replace(os.sep, "/")
+            if rel in listed:
+                drop.add(rel)
+        if drop:
+            rm = git(top, "update-index", "--force-remove", "-z", "--stdin", tenv=tenv, stdin="\0".join(sorted(drop)) + "\0")
+            if rm.returncode != 0:
+                state["error"] = "git update-index on the throwaway index failed: %s" % last(rm)
+                return state
+        tree = git(top, "write-tree", tenv=tenv)
+        if tree.returncode != 0 or not tree.stdout.strip():
+            state["error"] = "git write-tree on the throwaway index failed: %s" % last(tree)
+            return state
+        state["status"] = tree.stdout.strip()
+        return state
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def join_hits(hits, n=6, sep="; "):
@@ -97,7 +168,8 @@ def join_hits(hits, n=6, sep="; "):
     shown = sep.join(hits[:n])
     if len(hits) <= n:
         return shown
-    fp = hashlib.sha1("\n".join(sorted(hits)).encode()).hexdigest()[:10]
+    # A display fingerprint so a reader sees the hidden list changed, never a security check.
+    fp = hashlib.sha1("\n".join(sorted(hits)).encode(), usedforsecurity=False).hexdigest()[:10]  # nosemgrep: python.lang.security.insecure-hash-algorithms.insecure-hash-algorithm-sha1
     return "%s (+%d more; %d total, fingerprint %s)" % (shown, len(hits) - n, len(hits), fp)
 
 
