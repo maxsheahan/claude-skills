@@ -1,6 +1,6 @@
 {
   "name": "secure-secrets",
-  "version": "0.5.5",
+  "version": "0.6.1",
   "author": { "name": "Max Sheahan" },
   "description": "Keep secret values out of repos and out of captured sessions: a gitleaks scan proven on planted keys, values never printed; a staged PreToolUse guard that blocks commands which print secrets; a capture-folder scanner; and a per-provider rotation runbook with a shape check that never displays the value. Requires secure-core."
 }

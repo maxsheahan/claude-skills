@@ -1,6 +1,6 @@
 {
   "name": "secure-platform",
-  "version": "0.5.5",
+  "version": "0.6.1",
   "author": { "name": "Max Sheahan" },
   "description": "One adapter per supported platform, each stating what it checks and what it cannot see: Cloudflare Pages and Workers (headers on every path, no secrets in [vars], previews off production data, edge hardening), Next.js on OpenNext (server actions, NEXT_PUBLIC_ secrets, static-export headers), Fly and Supabase (RLS, service-role key, [env] secrets, exposed ports), Google Apps Script (web app access, scopes, keys in code), Railway (environment dumps, count-only variable reads), and the Cloudflare account itself through the API or a snapshot (zone SSL, TLS, HTTPS, HSTS, DNSSEC; dangling pages.dev CNAMEs; members without 2FA; preview secrets; orphan KV; data Workers exposed on workers.dev). Requires secure-core."
 }

@@ -66,13 +66,20 @@ AUTHISH = re.compile(r"auth|session|login|sign|turnstile|verify|jwt", re.I)
 
 # A local that holds an env secret: `const { ADMIN_TOKEN } = c.env`, `const token = env.ADMIN_TOKEN`.
 ENV_DESTRUCT = re.compile(r"(?:const|let|var)\s*\{([^}]{1,300})\}\s*=\s*(?:[\w$]+\.)*(?:env|process\.env)\b")
-ENV_ALIAS = re.compile(r"(?:const|let|var)\s+([\w$]+)\s*=\s*(?:[\w$]+\.)*(?:env|process\.env)\.([\w$]+)\s*[;\n]")
+# the read may carry a TS cast or an empty default (`c.env.ADMIN_TOKEN as string`, `?? ''`, `|| ''`): still the secret
+ENV_ALIAS = re.compile(r"(?:const|let|var)\s+([\w$]+)\s*(?::[^=\n]{0,80})?=\s*(?:[\w$]+\.)*(?:env|process\.env)\.([\w$]+)\s*(?:(?:as\s+[^;\n]{1,80}|\?\?[^;\n]{1,80}|\|\|[^;\n]{1,80}))?\s*[;\n]")
 # The guard around an off-switch is auth-shaped: it compares a token, secret or password, calls a
-# verifier, answers 401/403, reads the Authorization header, or sets an identity.
+# verifier, answers 401/403, READS the Authorization header (an outbound fetch's `'Authorization':` key sends
+# one, Phase 10), or sets or reads an identity (an allow-list over c.get('email') that redirects strangers).
 AUTH_SHAPE = re.compile(r"\b40[13]\b|\b(?:bearerAuth|basicAuth|jwtVerify|getSession|verifySession|requireUser|requireAuth|authenticate|timingSafeEqual|verify\w*)\s*\("
-                        r"|Unauthorized|Forbidden|['\"]authorization['\"]|c\.set\(\s*['\"](?:user|email|teacher|account|identity|session|auth)|req\.user\s*=|\bisAdmin\b", re.I)
+                        r"|Unauthorized|Forbidden|(?:\.header|\.get|headers\.get|getHeader)\(\s*['\"]authorization['\"]|headers\.authorization\b|headers\[\s*['\"]authorization['\"]\s*\](?!\s*=(?!=))"
+                        r"|c\.(?:set|get)\(\s*['\"](?:user|email|teacher|account|identity|session|auth)|c\.var\.(?:user|email|session)\b|req\.(?:user|session)\b|\bisAdmin\b", re.I)
 AUTH_COMPARE = re.compile(r"(?:===|!==|==|!=)\s*[^\n;]{0,80}(?:TOKEN|SECRET|PASS|KEY|[Tt]oken|[Ss]ecret|[Pp]assword)|(?:TOKEN|SECRET|PASS|KEY|[Tt]oken|[Ss]ecret|[Pp]assword)\w*\s*(?:===|!==|==|!=)")
-AUTH_NAME = re.compile(r"AUTH|SESSION|JWT|ADMIN|PASS|LOGIN|SIGN|TURNSTILE|ACCESS|INVITE|SECRET|CREDENTIAL|API_?KEY", re.I)
+# Judged word by word on the env name (ADMIN_TOKEN -> ADMIN, TOKEN), never as a substring: BYPASS_CACHE has no
+# PASS word and ACCESS_LOG_SINK names an access log, not Cloudflare Access (Phase 10). An allow-list of emails or
+# users is identity (ALLOWED_EMAILS).
+AUTH_WORD = re.compile(r"^(?:O?AUTH[NZ]?|AUTHORI[SZ]ATION|AUTHENTICATION|SESSIONS?|JWT|JWKS|ADMINS?|PASS|PASSWORD|PASSCODE|PASSPHRASE|LOGIN|SIGNIN|SIGNING|TURNSTILE"
+                       r"|ACCESS|INVITES?|SECRETS?|CREDENTIALS?|APIKEY|ALLOWLIST|WHITELIST)$", re.I)
 
 HEADER_READ = re.compile(
     r"""(?:\.header\(|headers\.get\(|headers\[|\.get\(|getHeader\()\s*['"](cf-access-authenticated-user-email|x-teacher-id|x-user(?:-[\w-]+)?|x-userid|x-email|x-auth-email"""
@@ -81,10 +88,15 @@ HEADER_READ = re.compile(
 ASSERTION = re.compile(r"Cf-Access-Jwt-Assertion", re.I)
 # Verification is a verify CALL. Importing jose proves nothing, and decodeJwt reads the claims of a forged
 # token just as happily as a real one (bench 2026-11-01).
-VERIFIER = re.compile(r"\b(?:jwtVerify|compactVerify|flattenedVerify|generalVerify|verifyAccessJwt|verify\w*(?:Jwt|JWT|Token|Access|Assertion)\w*)\s*\(|\bjose\.jwtVerify\s*\(")
+# jsonwebtoken's jwt.verify(token, key, { issuer, audience }) is a verify call too (Phase 10), as is a bare
+# verify(...) imported from a JWT library (hono/jwt, jsonwebtoken): see jwt_verify_names().
+VERIFIER = re.compile(r"\b(?:jwtVerify|compactVerify|flattenedVerify|generalVerify|verifyAccessJwt|verify\w*(?:Jwt|JWT|Token|Access|Assertion)\w*)\s*\(|\bjose\.jwtVerify\s*\("
+                      r"|\b(?:jwt|jsonwebtoken|JWT|jws)\.verify\s*\(")
+JWT_LIB_IMPORT = re.compile(r"""import\s*\{([^}]*)\}\s*from\s*['"](?:hono/jwt|jsonwebtoken|@tsndr/cloudflare-worker-jwt|jose|@hono/jwt)['"]""")
 DECODE_ONLY = re.compile(r"\bdecodeJwt\s*\(|\bjwtDecode\s*\(|\bjwt\.decode\s*\(")
-ISSUER = re.compile(r"\bissuer\s*:")
-AUDIENCE = re.compile(r"\baudience\s*:|\baud\b")
+# a key or the TS shorthand `{ issuer, audience }` (Phase 10)
+ISSUER = re.compile(r"\bissuer\b\s*[:,}]")
+AUDIENCE = re.compile(r"\baudience\b\s*[:,}]|\baud\b")
 ROUTE_DECL = re.compile(r"""custom_domain\s*[=:]\s*true|^\s*routes?\s*[=:]|["']?pattern["']?\s*[=:]\s*["'][^"']+["']|["']routes["']\s*:""", re.M)
 
 BETTER_AUTH = re.compile(r"betterAuth\s*\(|from\s+['\"]better-auth['\"]")
@@ -114,7 +126,26 @@ def _env_locals(text):
 def _auth_shaped(code, text, pos, env_name):
     """The off-switch at pos guards auth: its block has an auth shape, or the secret's name is auth-shaped."""
     block = walk.enclosing_block(code, text, pos)
-    return bool(AUTH_SHAPE.search(block) or AUTH_COMPARE.search(block) or AUTH_NAME.search(env_name))
+    return bool(AUTH_SHAPE.search(block) or AUTH_COMPARE.search(block) or auth_name(env_name))
+
+
+def auth_name(env_name):
+    """The env var's own name is auth-shaped, word by word: ADMIN_TOKEN, SESSION_SECRET, API_KEY, ALLOWED_EMAILS.
+    ACCESS followed by LOG is an access log; ALLOW(ED) counts only before LIST/EMAILS/USERS/DOMAINS/IDS."""
+    words = [w for w in re.split(r"_|(?<=[a-z])(?=[A-Z])", env_name) if w]
+    up = [w.upper() for w in words]
+    for i, w in enumerate(up):
+        nxt = up[i + 1] if i + 1 < len(up) else ""
+        if w == "ACCESS" and nxt in ("LOG", "LOGS"):
+            continue
+        if w in ("ALLOW", "ALLOWED") and nxt in ("LIST", "EMAILS", "USERS", "DOMAINS", "IDS"):
+            return True
+        if w == "API" and nxt == "KEY":
+            return True
+        if AUTH_WORD.match(w):
+            return True
+    # run-together names (ADMINTOKEN, SESSIONKEY): the words no product name hides
+    return bool(re.search(r"ADMIN|SESSION|JWT|PASSWORD|PASSCODE|SECRET|CREDENTIAL|TURNSTILE", env_name, re.I))
 
 
 def _call_args(text, pos):
@@ -130,15 +161,33 @@ def _call_args(text, pos):
     return text[i:i + 2000]
 
 
-def _verify_options(text, m):
+def jwt_verify_names(text):
+    """Local names of a `verify` imported from a JWT library: `import { verify } from 'hono/jwt'`."""
+    out = []
+    for m in JWT_LIB_IMPORT.finditer(text):
+        for x in m.group(1).split(","):
+            parts = re.split(r"\s+as\s+", x.strip())
+            if parts[0] == "verify":
+                out.append(parts[-1])
+    return out
+
+
+def _verify_options(text, m, repo=None, rel=None):
     """Text where jwtVerify's issuer and audience must appear: the call's arguments, plus the declaration of
-    any bare identifier passed as an argument (`jwtVerify(t, JWKS, opts)` with `const opts = {...}`)."""
+    any bare identifier passed as an argument (`jwtVerify(t, JWKS, opts)` with `const opts = {...}`), in
+    this file or, when the name is imported, in the file it comes from (Phase 10)."""
     args = _call_args(text, m.start())
     extra = ""
+    imports = surface.import_names(repo, rel, text) if repo and rel else {}
     for name in re.findall(r"[(,]\s*([A-Za-z_$][\w$]*)\s*(?=[,)])", args):
-        d = re.search(r"(?:const|let|var)\s+%s\s*(?::[^=\n]{0,80})?=\s*" % re.escape(name), text)
-        if d:
-            extra += walk.block(text, d.end()) or text[d.end():d.end() + 300]
+        scopes = [(text, name)]
+        if name in imports:
+            scopes.append((walk.read_code(os.path.join(repo, imports[name][0])), imports[name][1]))
+        for sc, nm in scopes:
+            d = re.search(r"(?:const|let|var)\s+%s\s*(?::[^=\n]{0,80})?=\s*" % re.escape(nm), sc)
+            if d:
+                extra += walk.block(sc, d.end()) or sc[d.end():d.end() + 300]
+                break
     return args + extra
 
 
@@ -161,6 +210,72 @@ def _hooks_close_signup(repo, rel, text, config):
     return False
 
 
+def _split_top(expr, op):
+    """Split expr on a top-level operator (`||` or `&&`), brackets and quotes respected."""
+    parts, depth, quote, last, i = [], 0, None, 0, 0
+    while i < len(expr):
+        ch = expr[i]
+        if quote:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+        elif ch in "'\"`":
+            quote = ch
+        elif ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        elif depth == 0 and expr.startswith(op, i):
+            parts.append(expr[last:i])
+            last = i + len(op)
+            i += len(op)
+            continue
+        i += 1
+    parts.append(expr[last:])
+    return [p.strip() for p in parts]
+
+
+SIGNUP_API = "/api/auth/sign-up/email"  # better-auth's sign-up endpoint under its default base path
+SIGNUP_LIT = re.compile(r"""(['"`])([^'"`\n]*sign-?up[^'"`\n]*)\1""", re.I)
+METHOD_EQ = re.compile(r"""\bmethod\s*(?:===|==)\s*['"](\w+)['"]|['"](\w+)['"]\s*(?:===|==)\s*[\w$.]*method\b""", re.I)
+
+
+def _signup_term_covers(term):
+    """A positive sign-up path test reaches the sign-up API: a substring or regex test always does; a
+    startsWith prefix does when the API path starts with it or a base segment precedes sign-up (a custom
+    basePath); an exact comparison only when it names the .../sign-up/email endpoint itself."""
+    if re.match(r"!(?!=)", term) or re.search(r"!==?|===?\s*false\b", term):
+        return False  # `!path.startsWith('/api/auth/sign-up')`: the allow-list EXEMPTS sign-up
+    lm = SIGNUP_LIT.search(term)
+    if not lm:
+        return True  # a regex literal or a constant: read as a substring test
+    lit = lm.group(2)
+    before = term[:lm.start()]
+    if re.search(r"(?:===|==)\s*$", before) or re.match(r"\s*(?:===|==)", term[lm.end():]):
+        return bool(re.search(r"sign-?up/email/?$", lit, re.I))
+    if re.search(r"\.startsWith\(\s*$", before):
+        return SIGNUP_API.startswith(lit) or bool(re.match(r"^/?[^/]+/.*sign-?up", lit, re.I))
+    return True
+
+
+def _refuses_signup_api(cond):
+    """The `if` condition refuses the sign-up API (Phase 10): some `||` branch holds a positive sign-up path
+    test that reaches the API endpoint, and no `&&` partner narrows it to a page-only method (GET)."""
+    inner = cond[1:-1] if cond.startswith("(") and cond.endswith(")") else cond
+    for disj in _split_top(inner, "||"):
+        conj = _split_top(disj, "&&")
+        terms = [c for c in conj if SIGNUP_PATH.search(c)]
+        if not terms or not all(_signup_term_covers(c) for c in terms):
+            continue
+        methods = {(a or b).upper() for c in conj for a, b in METHOD_EQ.findall(c)}
+        if methods and "POST" not in methods:
+            continue  # refuses only GET /sign-up: the page, not POST /api/auth/sign-up/email
+        return True
+    return False
+
+
 def _signup_refused(repo, files):
     """A Worker entry (one layer above better-auth) that refuses sign-up paths: `if (<path has sign-up> ...)`
     whose consequent returns 401, 403 or 404, with no fail-open in its condition or its helpers. Returns the
@@ -172,7 +287,7 @@ def _signup_refused(repo, files):
         t = walk.read_code(p)
         for m in re.finditer(r"\bif\s*\(", t):
             cond = _call_args(t, m.start())
-            if not SIGNUP_PATH.search(cond):
+            if not SIGNUP_PATH.search(cond) or not _refuses_signup_api(cond):
                 continue
             after = t[t.find("(", m.start()) + len(cond):]
             body = walk.block(after, 0) if after.lstrip().startswith("{") else after.split("\n", 1)[0]
@@ -238,9 +353,13 @@ def main():
             header_reads.append("%s:%d (%s)" % (rel, walk.line_of(t, m.start()), m.group(1).lower()))
         for m in ASSERTION.finditer(t):
             assertion_refs.append("%s:%d" % (rel, walk.line_of(t, m.start())))
-        for m in VERIFIER.finditer(t):
+        vnames = jwt_verify_names(t)
+        vcalls = list(VERIFIER.finditer(t))
+        if vnames:
+            vcalls += list(re.finditer(r"(?<![\w$.])(?:%s)\s*\(" % "|".join(re.escape(n) for n in vnames), t))
+        for m in vcalls:
             verifier_refs.append("%s:%d" % (rel, walk.line_of(t, m.start())))
-            verifier_opts.append(_verify_options(t, m))
+            verifier_opts.append(_verify_options(t, m, repo, rel))
         for m in DECODE_ONLY.finditer(t):
             decode_refs.append("%s:%d" % (rel, walk.line_of(t, m.start())))
     verified = bool(assertion_refs) and bool(verifier_refs)

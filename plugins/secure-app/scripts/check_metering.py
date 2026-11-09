@@ -13,7 +13,10 @@ reserved BEFORE the call, and the Worker also carries a rate-limit binding.
                         get/put, a Redis incr, a D1 usage row) or a call named
                         for reserving (reserve*, *Budget*, *Quota*, *Counter*,
                         checkSpendCap, overDailyLimit): a name that merely
-                        contains Daily (buildDailyDigest) counts nothing. No
+                        contains Daily (buildDailyDigest) counts nothing. A
+                        helper the repo defines is judged by its body, not its
+                        name: allowCall() that reserves a KV count is a counter,
+                        buildBudgetSummary() and reserveSeat() are not. No
                         counter FAILs high; a counter touched only AFTER the
                         call FAILs medium (a burst outruns it); a counter keyed
                         only on a value the caller supplies (a header, or a body
@@ -21,8 +24,10 @@ reserved BEFORE the call, and the Worker also carries a rate-limit binding.
                         medium (rotate the id, reset the cap).
   meter.ratelimit-binding a [[ratelimits]] binding in wrangler config when paid
                         calls exist, AND a `.limit(` call on that binding in
-                        served code; FAILs medium without either (a declared
-                        binding nobody calls limits nothing).
+                        served code (directly, through an alias, or through a
+                        helper parameter it is passed in as); FAILs medium
+                        without either (a declared binding nobody calls limits
+                        nothing).
 
 The binding is best-effort (per edge machine, eventually consistent); the
 counter is the hard cap. Measured 2026-10-13: a dashboard API's 20-a-minute
@@ -49,6 +54,8 @@ COUNTER = re.compile(
     r"\b(?:[\w$]+\.)*(?:env|c\.env|ctx\.env)\.[\w$]+\.(?:get|put|increment)\s*\(\s*(?P<key>[^)]{0,200})"
     r"|\b[\w$.]+\.(?:incr|incrby|hincrby|incrementBy|incrementAndGet)\s*\(\s*(?P<rkey>[^)]{0,200})"
     r"|\.prepare\s*\(\s*(?P<sql>[`'\"][^`'\"]{0,300}\b(?:usage|count|budget|quota|spend|llm_usage)\b[^`'\"]{0,300}[`'\"])"
+    # any SQL driver (asyncpg fetchval, pg query, sqlite execute): an UPDATE or INSERT of a usage/count row
+    r"|\.(?:execute|executemany|fetchval|fetchrow|fetchone|fetch|query|run|exec|sql)\s*\(\s*(?P<sqlw>[`'\"][^`'\"]{0,300}\b(?:UPDATE|INSERT|UPSERT)\b[^`'\"]{0,300}\b(?:usage|count|calls|budget|quota|spend)\w*\b[^`'\"]{0,300}[`'\"])"
     r"|\b(?P<call>(?:await\s+)?[\w$.]*(?:[Rr]eserve|[Bb]udget|[Qq]uota|[Cc]ounter|[Mm]eter|[Ss]pend|[Cc]ap|[Ll]imit|[Uu]sage)[\w$]*)\s*\(")
 COUNTER_TOKENS = {"reserve", "budget", "quota", "counter", "meter"}
 CAP_NOUNS = {"spend", "cap", "limit", "usage"}
@@ -62,7 +69,8 @@ FUNC_START = re.compile(
     r"^[ \t]*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s*\*?\s*(?P<f>[\w$]*)\s*(?:<[^>\n]{0,80}>)?\s*\(|"
     r"^[ \t]*(?:export\s+)?(?:const|let|var)\s+(?P<c>[\w$]+)\s*(?::[^=\n]{0,80})?=\s*(?:async\s*)?(?:<[^>\n]{0,80}>)?\s*(?:\([^)]{0,300}\)|[\w$]+)\s*(?::\s*[^=\n]{0,80})?=>|"
     r"^[ \t]*(?:public\s+|private\s+|static\s+)*(?:async\s+)?(?P<m>[\w$]+)\s*(?:<[^>\n]{0,80}>)?\s*\([^)]{0,300}\)\s*(?::\s*[^{\n]{0,80})?\{|"
-    r"^[ \t]*[\w$.]+\.(?:get|post|put|patch|delete|all|use)\s*\(\s*['\"`](?P<p>[^'\"`]*)['\"`]\s*,\s*(?:async\s*)?\([^)]{0,120}\)\s*=>\s*\{", re.M)
+    # a route callback, behind any middleware arguments on the same line (zValidator(...), requireAuth)
+    r"^[ \t]*[\w$.]+\.(?:get|post|put|patch|delete|all|use)\s*\(\s*['\"`](?P<p>[^'\"`]*)['\"`]\s*,(?:[^\n]*?,)??\s*(?:async\s*)?(?:\([^)]{0,120}\)\s*=>|function\s*\w*\s*\([^)]{0,120}\))\s*\{", re.M)
 # A cap middleware mounted over the calling route (app.use('/api/x/generate', requireCaps)) reserves before the handler runs.
 CAP_MW_NAME = re.compile(r"(?:require|enforce|check|with)\w*(?:[Cc]aps?|[Bb]udget|[Ss]pend|[Qq]uota|[Mm]eter)|(?:[Cc]aps?|[Bb]udget|[Ss]pend|[Qq]uota|[Mm]eter)\w*(?:[Gg]uard|[Gg]ate|[Mm]iddleware)")
 
@@ -93,8 +101,11 @@ def _counter_call(name):
     """A call name reserves when its tokens (camelCase and snake_case split) name a reservation: reserve,
     budget, quota, counter or meter, or a cap noun (spend, cap, limit, usage) with a checking verb.
     `buildDailyDigest` and `dailyLimit` are not reservations; `overDailySpendCap` and `reserve_daily_call` are."""
-    last = name.split(".")[-1]
-    toks = {t.lower() for t in re.findall(r"[A-Z]?[a-z0-9]+|[A-Z]+(?![a-z])", last)}
+    parts = name.replace("await", " ").strip().split(".")
+    split = lambda w: {t.lower() for t in re.findall(r"[A-Z]?[a-z0-9]+|[A-Z]+(?![a-z])", w)}
+    toks = split(parts[-1])
+    if len(parts) > 1 and toks and toks <= (CAP_VERBS | {"reserve", "increment", "incr"}):
+        toks |= split(parts[-2])  # a bare verb on a named object: spendGuard.check(), budget.consume()
     return bool(toks & COUNTER_TOKENS) or bool(toks & CAP_NOUNS and toks & CAP_VERBS)
 
 
@@ -151,12 +162,50 @@ def _enclosing(funcs, pos):
     return best
 
 
-def _counter_in(text, start, end):
+class Defs:
+    """Function definitions across the served tree, to judge a called helper by what its body does."""
+
+    def __init__(self, codes, texts, all_funcs):
+        self.codes, self.texts, self.by_name = codes, texts, {}
+        for rel, funcs in all_funcs.items():
+            for f in funcs:
+                if not f[0].startswith("<"):
+                    self.by_name.setdefault(f[0], []).append((rel, f))
+        self._memo = {}
+
+    def store_counter(self, name, depth=0):
+        """True / False when `name` is defined in the repo and its body does (or does not) read and write
+        a counter store, following its own helper calls; None when the repo does not define it."""
+        if name not in self.by_name:
+            return None
+        if name in self._memo:
+            return self._memo[name]
+        self._memo[name] = False
+        ok = False
+        for rel, f in self.by_name[name]:
+            if _counter_in(self.texts[rel], f[1], f[2], self if depth < 2 else None, depth + 1, code=self.codes[rel], skip=f[0]):
+                ok = True
+                break
+        self._memo[name] = ok
+        return ok
+
+
+CALL_NAME = re.compile(r"(?<![\w$])(?:await\s+)?((?:[\w$]+\.)*([A-Za-z_$][\w$]*))\s*\(")
+NOT_HELPERS = {"if", "for", "while", "switch", "catch", "return", "function", "fetch", "Number", "String", "Boolean", "JSON", "Date", "Math", "Error"}
+
+
+def _counter_in(text, start, end, defs=None, depth=0, code=None, skip=None):
     """Counter ops inside text[start:end] (comments stripped, strings kept): (position, key_text).
     A bare identifier as the key is resolved to its declaration, so `env.KV.get(key)` with
-    const key = ai:count:<day> above it counts."""
+    const key = ai:count:<day> above it counts. A called helper the repo defines counts when its body
+    reads and writes a counter (dailyLimitOk(env), allowCall(env)), whatever its name, and does not count
+    when its body touches no counter store (buildBudgetSummary(), reserveSeat()); a helper the repo does
+    not define is judged by its name (_counter_call)."""
     hits = []
+    seen = set()
     for m in COUNTER.finditer(text, start, end):
+        if code is not None and not (code[m.start()] == text[m.start()]):
+            continue  # inside a string
         key = m.group("key") if m.group("key") is not None else m.group("rkey")
         if key is not None:
             key = key.strip()
@@ -164,10 +213,24 @@ def _counter_in(text, start, end):
                 key = walk.decl_src(key, text[start:end], text) or key
             if not KEY_WORDS.search(key):
                 continue
-        if m.group("call") is not None and not _counter_call(m.group("call")):
-            continue
-        hits.append((m.start(), key or m.group("sql") or m.group("call") or ""))
-    return hits
+        if m.group("call") is not None:
+            last = m.group("call").split(".")[-1].replace("await", "").strip()
+            if last == skip or re.search(r"\bfunction\s*\*?\s*$", text[max(0, m.start() - 20):m.start()]):
+                continue  # the function's own name in its signature, or a recursive call
+            judged = defs.store_counter(last) if defs else None
+            if judged is False or (judged is None and not _counter_call(m.group("call"))):
+                continue
+            seen.add(m.start("call"))
+        hits.append((m.start(), key or m.group("sql") or m.group("sqlw") or m.group("call") or ""))
+    if defs is not None and code is not None:
+        for m in CALL_NAME.finditer(code, start, end):
+            name = m.group(2)
+            if m.start(1) in seen or name in NOT_HELPERS or name == skip or any(abs(m.start(1) - p) < 8 for p in seen):
+                continue
+            judged = defs.store_counter(name)
+            if judged or (judged is None and _counter_call(m.group(1))):
+                hits.append((m.start(), m.group(1)))  # a repo helper that counts, or a package's meter.reserve()
+    return sorted(hits)
 
 
 def _caller_keyed(code, func, key_text):
@@ -192,7 +255,7 @@ def _caller_keyed(code, func, key_text):
 MAX_DEPTH = 3  # call site -> helper -> route is the deepest chain seen in production (a classroom app)
 
 
-def _judge_site(repo, rel, pos, codes, texts, all_funcs, cap_mw):
+def _judge_site(repo, rel, pos, codes, texts, all_funcs, cap_mw, defs=None):
     """Walk from the call site up through its callers (at most MAX_DEPTH levels) until a counter
     or a cap middleware is found. Returns (verdict, note): verdict is ok / after / keyed / none."""
     f = _enclosing(all_funcs.get(rel, []), pos)
@@ -205,7 +268,7 @@ def _judge_site(repo, rel, pos, codes, texts, all_funcs, cap_mw):
             continue
         seen.add((rel, f[1]))
         code, text = codes[rel], texts[rel]
-        hits = _counter_in(text, f[1], f[2])
+        hits = _counter_in(text, f[1], f[2], defs, code=code, skip=f[0])
         pre = [(hp, k) for hp, k in hits if hp < pos]
         if pre:
             kp, ktext = pre[0]
@@ -262,6 +325,45 @@ def _ratelimit_names(cfg):
     return names
 
 
+def _binding_calls(codes, all_funcs, names):
+    """file:line of every `.limit(` on a declared binding: env.AI_LIMITER.limit(, an alias of it
+    (const limiter = c.env.AI_LIMITER), or a helper parameter it was passed in as (perIp(c.env.AI_LIMITER, c)
+    then binding.limit( inside perIp)."""
+    alt = "|".join(sorted(re.escape(n) for n in names)) if names else None
+    hits, passed = [], []
+    for rel, code in codes.items():
+        if rel.endswith((".tsx", ".jsx", ".py")):
+            continue
+        if alt is None:
+            hits += ["%s:%d" % (rel, walk.line_of(code, m.start())) for m in re.finditer(r"\benv\.[\w$]+\.limit\s*\(", code)]
+            continue
+        aliases = set(names)
+        for m in re.finditer(r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?::[^=\n]{0,60})?=\s*[\w$.]*\b(?:%s)\b\s*(?=[;\n)])" % alt, code):
+            aliases.add(m.group(1))
+        for m in re.finditer(r"\b(?:const|let|var)\s*\{([^}]*)\}\s*=\s*[\w$.]*\benv\b", code):
+            for x in m.group(1).split(","):
+                if x.split(":")[0].strip() in names:
+                    aliases.add(x.split(":")[-1].strip())
+        ali = "|".join(sorted(re.escape(a) for a in aliases if a))
+        hits += ["%s:%d" % (rel, walk.line_of(code, m.start())) for m in re.finditer(r"(?<![\w$])(?:[\w$]+\.)*(?:%s)\s*\.\s*limit\s*\(" % ali, code)]
+        for m in re.finditer(r"(?<![\w$.])([A-Za-z_$][\w$]*)\s*\(([^()]*)\)", code):
+            for i, a in enumerate(m.group(2).split(",")):
+                if re.match(r"^\s*(?:[\w$]+\.)*(?:%s)\s*$" % ali, a):
+                    passed.append((m.group(1), i))
+    for fname, i in passed:
+        for rel, funcs in all_funcs.items():
+            code = codes[rel]
+            for f in funcs:
+                if f[0] != fname:
+                    continue
+                sig = re.search(r"\(([^)]*)\)", code[f[1]:f[2]])
+                params = [re.split(r"[:=]", p)[0].strip() for p in sig.group(1).split(",")] if sig else []
+                if i < len(params) and re.match(r"^[A-Za-z_$][\w$]*$", params[i]):
+                    for m in re.finditer(r"(?<![\w$.])%s\s*\.\s*limit\s*\(" % re.escape(params[i]), code[f[1]:f[2]]):
+                        hits.append("%s:%d" % (rel, walk.line_of(code, f[1] + m.start())))
+    return sorted(set(hits))
+
+
 def main():
     repo = os.path.abspath(sys.argv[1])
     res = []
@@ -295,10 +397,11 @@ def main():
     all_funcs = {r: _functions(c, texts[r], py=r.endswith(".py")) for r, c in codes.items()}
     cap_mw = [(m.group(1).rstrip("*").rstrip("/") or "/", "%s:%d" % (r, ln)) for r, ln, m in walk.find(repo, surface.MW_RX, tests=False, served=True)
               if CAP_MW_NAME.search(m.group(2))]
+    defs = Defs(codes, texts, all_funcs)
     for prov, where in sorted(sites.items()):
         ok, none, after, keyed = [], [], [], []
         for rel, ln, pos in where:
-            verdict, note = _judge_site(repo, rel, pos, codes, texts, all_funcs, cap_mw)
+            verdict, note = _judge_site(repo, rel, pos, codes, texts, all_funcs, cap_mw, defs)
             if verdict == "none":
                 none.append("%s:%d (%s)" % (rel, ln, note))
             elif verdict == "after":
@@ -328,9 +431,7 @@ def main():
         cfg = "\n".join(l for l in cfg.splitlines() if not l.lstrip().startswith(("#", "//")))
         if RATELIMIT_CFG.search(cfg):
             names = _ratelimit_names(cfg)
-            call_rx = r"\b(?:%s)\.limit\s*\(" % "|".join(sorted(re.escape(n) for n in names)) if names else r"\benv\.[\w$]+\.limit\s*\("
-            called = ["%s:%d" % (r, ln) for r, ln, _ in walk.find(repo, call_rx, tests=False, served=True, strings=False)
-                      if not r.endswith((".tsx", ".jsx", ".html", ".vue", ".svelte"))]
+            called = _binding_calls(codes, all_funcs, names)
             if called:
                 res.append(result("meter.ratelimit-binding", "A rate-limit binding backs the counter", "PASS", "ratelimits binding declared in wrangler config and called at %s" % ledger.join_hits(called, 3, ", "),
                                   detail="best-effort only: per edge machine and eventually consistent (measured 2026-10-13: first 429 after about 30 requests; never across fresh connections); the counter is the hard cap"))

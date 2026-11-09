@@ -9,17 +9,23 @@
     Third-party actions on a tag FAIL medium; GitHub's own (actions/*,
     github/*) FAIL low. YAML comments are blanked first: a commented-out step
     is not a step.
+    A `uses:` inside a block scalar (a `run: |` heredoc) is text, not a step.
+    A `docker://` action FAILs unless it names an image digest (@sha256:...).
   - actions.secret-scope: any reference to the secrets context (`${{ secrets.X }}`,
     `${{secrets.X}}`, `${{ secrets['X'] }}`, `${{ toJSON(secrets) }}`) in a
-    workflow-level or job-level `env:` FAILs medium: every step of the job,
-    including third-party actions, can read it. The scoped pattern gives each
-    secret only to its step.
+    workflow-level, job-level or job-container (`jobs.<id>.container.env`)
+    `env:` FAILs medium: every step of the job, including third-party actions,
+    can read it. So does `secrets: inherit` on a reusable-workflow call. The
+    scoped pattern gives each secret only to its step.
   - tooling.wrangler: a deploy that runs wrangler through a one-off runner
-    (`npx`, `pnpm dlx`, `pnpx`, `bunx`, `bun x`, `yarn dlx`) with no wrangler
-    in package.json, `wrangler@latest`, a `latest`/`*` range, or the wrangler
-    action without `wranglerVersion` in that step (whatever order its keys
-    take) FAILs low (a new wrangler can change a deploy with no commit). Only
-    emitted when wrangler is used.
+    (`npx`, `npm exec`, `npm x`, `pnpm dlx`, `pnpx`, `bunx`, `bun x`,
+    `yarn dlx`, with any flags, `--`, or `-p wrangler`) with no wrangler in
+    package.json, a version that is not exact (`@latest`, `@beta`, `@4`,
+    `@^4.0.0`), a registry-fetching runner (`pnpm dlx`, `pnpx`, `yarn dlx`)
+    with no exact version, a `latest`/`*` range in package.json, or the
+    wrangler action without an exact `wranglerVersion` in that step (whatever
+    order its keys take, blank lines allowed) FAILs low (a new wrangler can
+    change a deploy with no commit). Only emitted when wrangler is used.
 """
 import os
 import re
@@ -37,8 +43,18 @@ SHA = re.compile(r"@[0-9a-f]{40}$")
 # Any read of the secrets context inside an expression: member (`secrets.X`), index (`secrets['X']`),
 # or the whole context (`toJSON(secrets)`), with or without spaces inside `${{ }}`.
 SECRET_REF = re.compile(r"\$\{\{[^}]*(?<![\w.])secrets(?![\w])")
-# wrangler run through a one-off package runner, which downloads whatever version is current.
-RUNNER_WRANGLER = re.compile(r"(?:\bnpx|\bpnpm\s+dlx|\bpnpx|\bbunx|\bbun\s+x|\byarn\s+dlx)\s+(?:--yes\s+|-y\s+|--quiet\s+|-q\s+)*wrangler(@[\w.\-]+)?(?![\w.\-@])")
+# wrangler run through a one-off package runner, which downloads whatever version is current. Any flags may
+# sit between the runner and the package (`-y`, `--bun`, `--`), and npm's `-p/--package wrangler[@v]` names it
+# before the command. Group 1: the runner; group 2: a version on -p; group 3: a version on the command.
+RUNNER_WRANGLER = re.compile(
+    r"(\bnpx|\bnpm\s+(?:exec|x)|\bpnpm\s+dlx|\bpnpx|\bbunx|\bbun\s+x|\byarn\s+dlx)"
+    r"(?:\s+(?:-p|--package)(?:=|\s+)wrangler(?:@([^\s'\"]+))?(?=\s)|\s+--?[A-Za-z][\w-]*(?:=[^\s'\"]+)?|\s+--(?=\s))*"
+    r"\s+wrangler(?![\w.\-])(?:@([^\s'\"]+))?")
+# Runners that always fetch from the registry, never the project's installed copy.
+FETCHING_RUNNER = re.compile(r"^(?:pnpm\s+dlx|pnpx|yarn\s+dlx)$")
+EXACT = re.compile(r"^\d+\.\d+\.\d+(?:-[0-9A-Za-z.\-]+)?$")
+# A docker:// action is pinned only by an image digest.
+DOCKER_DIGEST = re.compile(r"@sha256:[0-9a-f]{64}$")
 
 
 def yaml_code(text):
@@ -64,6 +80,25 @@ def yaml_code(text):
     return "\n".join(out)
 
 
+def blank_block_scalars(text):
+    """The workflow with the BODY of every block scalar (`run: |`, `script: >-`, any `key: |`) blanked, same
+    length and line breaks: a `uses:` written inside a heredoc is text, not a step. Used for the uses: scan
+    only; the wrangler scan reads run: bodies, which is where commands live."""
+    lines = text.split("\n")
+    out, body_ind = [], None
+    for l in lines:
+        ind = len(l) - len(l.lstrip())
+        if body_ind is not None:
+            if not l.strip() or ind > body_ind:
+                out.append(" " * len(l))
+                continue
+            body_ind = None
+        out.append(l)
+        if re.search(r":\s*[|>][+\-0-9]*\s*$", l):
+            body_ind = ind if not l.lstrip().startswith("- ") else ind + 2
+    return "\n".join(out)
+
+
 def step_block(lines, i):
     """The whole step that owns line i (a `uses:` line): from its `- ` dash line to the line before the
     next step or a shallower key, so `name:`/`uses:`/`with:` are read together in any order. A line with
@@ -74,11 +109,11 @@ def step_block(lines, i):
         key_ind += 2
     dash_ind = key_ind - 2
     start = i
-    while start > 0 and not re.match(r"^\s{%d}- " % dash_ind, lines[start]) and lines[start].strip():
+    while start > 0 and not re.match(r"^\s{%d}- " % dash_ind, lines[start]):
         ind = len(lines[start]) - len(lines[start].lstrip())
-        if ind < key_ind:
+        if lines[start].strip() and ind < key_ind:
             break
-        start -= 1
+        start -= 1  # a blank line inside the step does not end it
     if not re.match(r"^\s{%d}- " % dash_ind, lines[start]):
         return lines[i] + "\n" + block(lines, i)
     out = [lines[start]]
@@ -102,28 +137,34 @@ def workflows(repo):
 
 
 def env_level(lines, i):
-    """'workflow', 'job' or 'step' for an `env:` line at index i."""
+    """Who can read an `env:` at line i: 'workflow', 'job', 'job container' (jobs.<id>.container.env, read by
+    every step that runs in the container) or 'step' (a step, or a service container, which gets only its own).
+    Worked out from the chain of parent keys, nearest first."""
     ind = len(lines[i]) - len(lines[i].lstrip())
     if ind == 0:
         return "workflow"
-    j = i - 1
-    while j >= 0:
+    chain, cur = [], ind
+    for j in range(i - 1, -1, -1):
         l = lines[j]
-        if l.strip() and not l.lstrip().startswith("#"):
-            jind = len(l) - len(l.lstrip())
-            if jind < ind:
-                if l.lstrip().startswith("- "):
-                    return "step"
-                # a mapping key: is it a job id (a direct child of `jobs:`)?
-                k = j - 1
-                while k >= 0:
-                    kl = lines[k]
-                    if kl.strip() and not kl.lstrip().startswith("#") and len(kl) - len(kl.lstrip()) < jind:
-                        return "job" if kl.strip() == "jobs:" else "step"
-                    k -= 1
-                return "job"
-        j -= 1
-    return "workflow"
+        if not l.strip():
+            continue
+        jind = len(l) - len(l.lstrip())
+        if jind < cur:
+            st = l.strip()
+            if st.startswith("- "):
+                return "step"
+            chain.append(st.split(":", 1)[0].strip().strip("'\""))
+            cur = jind
+            if jind == 0:
+                break
+    chain.reverse()  # top-level key first
+    if not chain or chain[0] != "jobs":
+        return "step"  # a composite action's runs:, or nothing a whole job reads
+    if len(chain) == 2:
+        return "job"
+    if len(chain) == 3 and chain[2] == "container":
+        return "job container"
+    return "step"
 
 
 def block(lines, i):
@@ -144,9 +185,13 @@ def main():
     for p in wfs:
         t = yaml_code(walk.read(p))
         r = walk.rel(repo, p)
-        for m in USES.finditer(t):
+        for m in USES.finditer(blank_block_scalars(t)):
             u = m.group(1)
-            if u.startswith(("./", "docker://")) or "@" not in u:
+            if u.startswith("docker://"):
+                if not DOCKER_DIGEST.search(u):  # a tag (or none) is a mutable image
+                    unpinned.append((False, "%s:%d %s" % (r, walk.line_of(t, m.start()), u)))
+                continue
+            if u.startswith("./") or "@" not in u:
                 continue
             if not SHA.search(u):
                 first = u.split("/")[0] in ("actions", "github")
@@ -158,6 +203,9 @@ def main():
                 lvl = env_level(lines, i)
                 if lvl != "step":
                     broad.append("%s:%d (%s-level env)" % (r, i + 1, lvl))
+            if re.match(r"^\s*secrets:\s*['\"]?inherit['\"]?\s*$", l):
+                # a job calling a reusable workflow hands it EVERY secret of the repo
+                broad.append("%s:%d (secrets: inherit hands every secret to the called workflow)" % (r, i + 1))
     if not wfs:
         res.append(result("actions.pinned", "GitHub Actions pinned to commit SHAs", "PASS", "no .github/workflows in the repo"))
     elif unpinned:
@@ -209,13 +257,23 @@ def main():
         r = walk.rel(repo, p)
         for m in RUNNER_WRANGLER.finditer(t):
             uses_wrangler = True
-            ver = m.group(1)
-            if ver == "@latest" or (not ver and not pinned_in_pkg):
-                problems.append("%s:%d %s (no pinned version)" % (r, walk.line_of(t, m.start()), " ".join(m.group(0).split())))
+            runner, ver = " ".join(m.group(1).split()), m.group(2) or m.group(3)
+            where = "%s:%d %s" % (r, walk.line_of(t, m.start()), " ".join(m.group(0).split()))
+            if ver:
+                if not EXACT.match(ver.strip("'\"")):  # latest, a dist-tag, a major, a ^/~ range
+                    problems.append("%s (wrangler@%s is not an exact version)" % (where, ver))
+            elif FETCHING_RUNNER.match(runner):
+                problems.append("%s (%s always downloads the current wrangler, whatever package.json pins)" % (where, runner))
+            elif not pinned_in_pkg:
+                problems.append("%s (no pinned version)" % where)
         for m in re.finditer(r"uses:\s*['\"]?cloudflare/wrangler-action@[^'\"\s,}]+", t):
             uses_wrangler = True
-            if "wranglerVersion" not in step_block(t.split("\n"), walk.line_of(t, m.start()) - 1):
+            step = step_block(t.split("\n"), walk.line_of(t, m.start()) - 1)
+            vm = re.search(r"(?m)(?:^|[\s{,])wranglerVersion:\s*['\"]?([^'\"\s,}]*)", step)
+            if not vm:
                 problems.append("%s:%d wrangler-action without wranglerVersion" % (r, walk.line_of(t, m.start())))
+            elif not EXACT.match(vm.group(1)):
+                problems.append("%s:%d wrangler-action wranglerVersion %r is not an exact version" % (r, walk.line_of(t, m.start()), vm.group(1)))
     if uses_wrangler:
         if problems:
             res.append(result("tooling.wrangler", "Deploy tool pinned to an exact version", "FAIL", ledger.join_hits(problems, 6, "; "), severity="low",

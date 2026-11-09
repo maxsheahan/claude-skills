@@ -190,4 +190,43 @@ export default function Post({ body }) { return <ReactMarkdown>{body}</ReactMark
 for name, (files, cid, want) in P8.items():
     code, ck, out = T.run(S, T.tree(files))
     T.status_is("p8 " + name, ck, cid, want, out)
+# ---- Phase 10 secrets-ai ----
+# One FAIL and one PASS fixture per mechanism introduced in Phase 10.
+AI10 = "import Anthropic from '@anthropic-ai/sdk'\n"
+W10 = "export default { async fetch(req, env) {\n  const ai = new Anthropic()\n%s\n  return Response.json({ reply: r.content[0].text })\n} }\n"
+CALL10 = "  const r = await ai.messages.create({ model: 'm', max_tokens: 9, system: %s, messages: [{ role: 'user', content: q }] })"
+P10 = {
+    "system as content blocks with caller text": ("  const { tone, q } = await req.json()\n" + CALL10 % "[{ type: 'text', text: `Answer in a ${tone} tone.` }]", "FAIL"),
+    "system as content blocks with fixed text": ("  const { q } = await req.json()\n" + CALL10 % "[{ type: 'text', text: 'Answer briefly.' }]", "PASS"),
+    "let then += with caller text": ("  const body = await req.json(); const q = body.q\n  let sys = 'You help.'\n  sys += ` ${body.company} users`\n" + CALL10 % "sys", "FAIL"),
+    "let then += with fixed text": ("  const { q } = await req.json()\n  let sys = 'You help.'\n  sys += ' Be brief.'\n" + CALL10 % "sys", "PASS"),
+    "helper that interpolates its parameter": ("  const { persona, q } = await req.json()\n" + CALL10 % "build(persona)", "FAIL"),
+    "helper that only picks a fixed prompt": ("  const { mode, q } = await req.json()\n" + CALL10 % "pick(mode)", "PASS"),
+}
+HELPERS10 = "function build(p) { return `You are ${p}.` }\nconst PROMPTS = { a: 'Be brief.' }\nfunction pick(m) { return PROMPTS[m] ?? PROMPTS.a }\n"
+for name, (body, want) in P10.items():
+    code, ck, out = T.run(S, T.tree({"package.json": PKG, "src/w.ts": AI10 + HELPERS10 + W10 % body}))
+    T.status_is("p10 " + name, ck, "ai.prompt.system-input", want, out)
+SRV10 = {"src/w.ts": AI10 + "export const ai = new Anthropic()\n"}
+H10 = {
+    "reassigned through a sanitizer before the sink": ("export function show(reply) {\n  reply = DOMPurify.sanitize(reply)\n  document.body.innerHTML = reply\n}\n", "PASS"),
+    "sanitized only AFTER the sink": ("export function show(reply) {\n  document.body.innerHTML = reply\n  reply = DOMPurify.sanitize(reply)\n}\n", "FAIL"),
+    "a helper in the file that sanitizes": ("function safe(s) { return DOMPurify.sanitize(s) }\nexport function show(answer) { document.body.innerHTML = safe(answer) }\n", "PASS"),
+    "a helper in the file that does not sanitize": ("function wrap(s) { return '<p>' + s + '</p>' }\nexport function show(answer) { document.body.innerHTML = wrap(answer) }\n", "FAIL"),
+}
+for name, (body, want) in H10.items():
+    code, ck, out = T.run(S, T.tree(dict({"package.json": PKG, "public/chat.js": "import DOMPurify from 'dompurify'\n" + body}, **SRV10)))
+    T.status_is("p10 html " + name, ck, "ai.output.html", want, out)
+MD10 = {
+    "two renders, only the first restricted": ({"app/chat/Thread.tsx": "import ReactMarkdown from 'react-markdown'\nexport default function T({ a, b }) { return <><ReactMarkdown disallowedElements={['img']}>{a}</ReactMarkdown><ReactMarkdown>{b}</ReactMarkdown></> }\n"}, "FAIL"),
+    "two renders, both restricted": ({"app/chat/Thread.tsx": "import ReactMarkdown from 'react-markdown'\nexport default function T({ a, b }) { return <><ReactMarkdown disallowedElements={['img']}>{a}</ReactMarkdown><ReactMarkdown urlTransform={safeUrl}>{b}</ReactMarkdown></> }\n"}, "PASS"),
+    "a message component rendering its prop": ({"components/MessageBubble.tsx": "import ReactMarkdown from 'react-markdown'\nexport default function M({ content }) { return <ReactMarkdown>{content}</ReactMarkdown> }\n"}, "FAIL"),
+    "a chat-path page rendering an imported README": ({"app/chatbot/docs/page.tsx": "import ReactMarkdown from 'react-markdown'\nimport { README } from '../../content'\nexport default function D() { return <ReactMarkdown>{README}</ReactMarkdown> }\n"}, "PASS"),
+    "useChat messages rendered as Markdown": ({"components/Stream.tsx": "import Markdown from 'react-markdown'\nimport { useChat } from 'ai/react'\nexport default function S() { const { messages } = useChat(); return messages.map(m => <Markdown key={m.id}>{m.content}</Markdown>) }\n"}, "FAIL"),
+}
+for name, (files, want) in MD10.items():
+    code, ck, out = T.run(S, T.tree(dict(dict({"package.json": PKG}, **files), **SRV10)))
+    T.status_is("p10 md " + name, ck, "ai.output.markdown", want, out)
+# ---- end Phase 10 secrets-ai ----
+
 T.finish()

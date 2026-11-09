@@ -1,6 +1,6 @@
 {
   "name": "secure-supply-chain",
-  "version": "0.5.5",
+  "version": "0.6.1",
   "author": { "name": "Max Sheahan" },
   "description": "Dependency risk without auto-bumps: production npm audit with per-advisory reachability triage recorded in the repo, lockfile presence, GitHub Actions pinned to SHAs with secrets scoped per step, wrangler pinned, and a check that the BUILT code resolves and loads under plain Node (vitest resolves differently). Requires secure-core."
 }

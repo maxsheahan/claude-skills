@@ -28,6 +28,22 @@ reading that both plugins' unit tests and the full bench accept:
 - Strong words count anywhere as a whole segment or pair (cloudflare rule, kept): SECRET,
   SECRETS, PASSWORD, PASSWD, PASSCODE, CREDENTIAL(S), DSN, PRIVATE_KEY, SERVICE_ROLE,
   CLIENT_SECRET, SIGNING_KEY, SECRET_KEY.
+- Phase 10 (2026-11-07): a camelCase or kebab name is split into the same segments as its
+  SNAKE_CASE twin before any rule runs (openaiApiKey reads as OPENAI_API_KEY; a JSON config
+  writes names that way), the compound words written without the underscore are in the
+  vocabulary (APITOKEN, ACCESSTOKEN, SECRETKEY, PRIVATEKEY), and the PLURAL of a compound
+  credential word is a credential (ALLOWED_API_KEYS is the accepted bearer set, PASSWORDS,
+  SIGNING_KEYS). A bare plural weak word stays config: MAX_TOKENS, SORT_KEYS.
+  Under `browser=True` the vendor keys documented as browser-safe are public too (Sentry DSN,
+  Firebase web API key, PostHog project key, Algolia search-only key), like Mapbox and Maps.
+- Phase 10 audit (2026-11-07): a CONNECTION-STRING name followed by variant words is still the
+  connection string. Neon's DATABASE_URL_UNPOOLED, Vercel's POSTGRES_URL_NON_POOLING and
+  REDIS_URL_REPLICA carry the same password as the bare name. The trailing words in
+  CONN_VARIANT (pooling mode, replica role, environment, migration or owner role) are
+  stripped and the database URL rule asks again; nothing else is stripped, so
+  APP_URL_STAGING and DB_HOST_PRIMARY stay settings and API_KEY_PROD keeps its old answer.
+  This rule used to live in check_fly_supabase.env_secret, so `[vars] DATABASE_URL_UNPOOLED`
+  PASSed cf.vars-secrets while fly.env-secrets FAILed it; one home now.
 - `browser=True` (a name a bundler ships, prefix already stripped) treats Google's
   referrer-restricted Maps key names as public; the same name in wrangler [vars] or fly
   [env] is a server key and stays a secret (cloudflare rule, kept).
@@ -43,10 +59,14 @@ import ledger
 
 # Strong: a credential wherever the segment (or adjacent pair) appears.
 SECRET_SEGMENTS = {"SECRET", "SECRETS", "PASSWORD", "PASSWD", "PASSCODE", "CREDENTIAL", "CREDENTIALS", "DSN",
-                   "PRIVATE_KEY", "SERVICE_ROLE", "CLIENT_SECRET", "SIGNING_KEY", "SECRET_KEY"}
+                   "PRIVATE_KEY", "SERVICE_ROLE", "CLIENT_SECRET", "SIGNING_KEY", "SECRET_KEY",
+                   "SECRETKEY", "PRIVATEKEY", "CLIENTSECRET", "SIGNINGKEY"}
 # Weak: a credential only as the last segment or the last pair.
 SECRET_SUFFIXES = {"KEY", "TOKEN", "SALT", "API_KEY", "ACCESS_KEY", "AUTH_TOKEN", "ACCESS_TOKEN", "PRIVATE",
-                   "PASS", "PWD", "APIKEY"}
+                   "PASS", "PWD", "APIKEY", "APITOKEN", "ACCESSTOKEN", "AUTHTOKEN", "ACCESSKEY",
+                   "API_TOKEN", "BEARER_TOKEN", "REFRESH_TOKEN", "CLIENT_KEY"}
+# The single weak words: their plural (MAX_TOKENS, SORT_KEYS) is config, not a credential set.
+BARE_WEAK = {"KEY", "TOKEN", "SALT", "PRIVATE", "PASS", "PWD"}
 # Public by design: the provider documents the browser as the value's home and
 # restricts it by domain or scope server-side. A publishable/site/anon key or a
 # PUBLIC_ segment is meant to ship; Mapbox's public token (pk., URL-restricted)
@@ -58,6 +78,13 @@ PUBLIC_NAMES = {"MAPBOX_TOKEN", "MAPBOX_ACCESS_TOKEN"}
 # referrer-restricted, while the same name in wrangler [vars] or fly [env] is a server key and stays a secret
 # (Phase 8, 2026-11-01).
 BROWSER_PUBLIC_NAMES = {"GOOGLE_MAPS_API_KEY", "GOOGLE_MAPS_KEY", "MAPS_API_KEY", "MAPS_KEY"}
+# Vendor keys whose own docs put them in the browser (Phase 10, 2026-11-07): a Sentry DSN only accepts
+# events, a Firebase web apiKey identifies the project (security rules guard the data), a PostHog
+# project key (phc_) only ingests, an Algolia search-only key only searches. Matched as the whole name
+# or its tail after an app prefix (SHOP_SENTRY_DSN). Their server twins (ALGOLIA_ADMIN_KEY,
+# POSTHOG_PERSONAL_API_KEY, FIREBASE_PRIVATE_KEY) do not match and stay secrets.
+BROWSER_PUBLIC_VENDOR = re.compile(r"(?:^|_)(?:SENTRY_DSN|FIREBASE_(?:WEB_)?API_KEY|POSTHOG_(?:PROJECT_)?(?:API_)?KEY"
+                                   r"|ALGOLIA_SEARCH(?:_ONLY)?(?:_API)?_KEY)$")
 # A name ending in one of these holds a setting ABOUT a secret, not the secret.
 SETTING_SUFFIX = {"ISSUER", "URL", "URI", "ENDPOINT", "HOST", "ID", "NAME", "PREFIX", "SUFFIX", "TTL", "SECONDS", "MS", "MINUTES", "HOURS", "DAYS",
                   "LENGTH", "LEN", "SIZE", "COUNT", "LIMIT", "MAX", "MIN", "HEADER", "AUDIENCE", "AUD", "ALGORITHM", "ALG", "PATH", "FILE", "DIR",
@@ -65,7 +92,28 @@ SETTING_SUFFIX = {"ISSUER", "URL", "URI", "ENDPOINT", "HOST", "ID", "NAME", "PRE
                   "REGION", "BUCKET", "TABLE", "ROTATION", "POLICY", "HINT", "LABEL", "FIELD", "PARAM", "COOKIE", "STORE", "PROVIDER", "KID"}
 # A connection string carries its password: DATABASE_URL, REDIS_URL, PG_DSN, MONGODB_URI.
 DB_URL = re.compile(r"(?:^|_)(?:DATABASE|DB|POSTGRES|POSTGRESQL|PG|MYSQL|MONGO|MONGODB|REDIS|AMQP|RABBITMQ|KAFKA|NEON|CONNECTION)_?(?:URL|URI|DSN|STRING)$")
+# Words a provider appends to a connection-string name for a variant of the same database (Phase 10 audit).
+CONN_VARIANT = {"UNPOOLED", "POOLED", "POOLER", "NON", "POOLING", "DIRECT", "PRIMARY", "REPLICA", "READONLY", "RO", "RW",
+                "PROD", "PRODUCTION", "STAGING", "DEV", "TEST", "SHADOW", "MIGRATE", "MIGRATION", "MIGRATIONS", "ADMIN",
+                "OWNER", "SESSION", "TRANSACTION", "PRISMA", "INTERNAL", "EXTERNAL"}
 URL_PASSWORD = re.compile(r"://[^/\s:@'\"]+:[^@\s/'\"]+@")
+# camelCase / PascalCase boundaries: aB, a1B, and the end of an acronym run (APIKey -> API_Key).
+CAMEL = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
+
+
+def _segments(name):
+    """SNAKE segments of a name in any case convention: openaiApiKey, openai-api-key and
+    OPENAI_API_KEY all give [OPENAI, API, KEY]. An all-lowercase or all-caps run is not split."""
+    n = CAMEL.sub("_", name.strip()).replace("-", "_").replace(".", "_").upper()
+    return [s for s in n.split("_") if s]
+
+
+def _singular(segs):
+    """The same segments with the last one de-pluralized (KEYS -> KEY), or None when it is not plural."""
+    last = segs[-1]
+    if len(last) > 3 and last.endswith("S") and not last.endswith("SS"):
+        return segs[:-1] + [last[:-1]]
+    return None
 
 
 def secret_name(name, value=None, browser=False):
@@ -74,19 +122,31 @@ def secret_name(name, value=None, browser=False):
     `browser=True` judges a name a bundler ships to the browser (the prefix already stripped)."""
     if value and (any(p.search(value) for p in ledger.SECRET_SHAPES) or URL_PASSWORD.search(value)):
         return True
-    n = name.upper().strip()
-    segs = [s for s in n.split("_") if s]
+    segs = _segments(name)
     if not segs:
         return False
-    if browser and n in BROWSER_PUBLIC_NAMES:
+    n = "_".join(segs)
+    if browser and (n in BROWSER_PUBLIC_NAMES or BROWSER_PUBLIC_VENDOR.search(n)):
         return False
     if n in PUBLIC_NAMES or set(segs) & PUBLIC_SEGMENTS or any(n == s or n.endswith("_" + s) for s in PUBLIC_SUFFIXES):
         return False
-    if DB_URL.search(n):
+    core = segs
+    while len(core) > 1 and core[-1] in CONN_VARIANT:
+        core = core[:-1]
+    if DB_URL.search("_".join(core)):
         return True
     if segs[-1] in SETTING_SUFFIX:
         return False
     pairs = {"_".join(segs[i:i + 2]) for i in range(len(segs) - 1)}
     if set(segs) & SECRET_SEGMENTS or pairs & SECRET_SEGMENTS:
         return True
-    return segs[-1] in SECRET_SUFFIXES or "_".join(segs[-2:]) in SECRET_SUFFIXES
+    if segs[-1] in SECRET_SUFFIXES or "_".join(segs[-2:]) in SECRET_SUFFIXES:
+        return True
+    # A plural compound credential word (API_KEYS, SIGNING_KEYS, PASSWORDS, APITOKENS) is the credential set;
+    # a bare plural weak word (MAX_TOKENS, SORT_KEYS) is config.
+    one = _singular(segs)
+    if one is None:
+        return False
+    last, pair = one[-1], "_".join(one[-2:])
+    return (last in SECRET_SEGMENTS or (last in SECRET_SUFFIXES and last not in BARE_WEAK)
+            or (len(one) > 1 and (pair in SECRET_SUFFIXES or pair in SECRET_SEGMENTS)))

@@ -249,4 +249,170 @@ T.expect("P9 decl: the first scope with a binding wins; none means ''", walk.dec
 _pj = json.load(open(os.path.join(HERE, "..", ".claude-plugin", "plugin.json")))
 T.expect("ledger.SUITE_VERSION equals secure-core's plugin.json version", ledger.SUITE_VERSION == _pj["version"], "%s vs %s" % (ledger.SUITE_VERSION, _pj["version"]))
 
+# ---- Phase 10 supply-core-gate ----
+# ledger.git_state hashes CONTENT through a throwaway index; the repo's index, HEAD and objects are only read.
+import hashlib  # noqa: E402
+
+
+def _digest(path):
+    return hashlib.sha256(open(path, "rb").read()).hexdigest() if os.path.exists(path) else None
+
+
+def _objects(repo):
+    return sorted(os.path.relpath(os.path.join(r, n), repo) for r, _, ns in os.walk(os.path.join(repo, ".git", "objects")) for n in ns)
+
+
+_g = T.git_init(T.tree({"src/a.ts": "export const a = 1\n", ".gitignore": "scratch/\n"}))
+open(os.path.join(_g, "src", "a.ts"), "a").write("// dirty at run time\n")
+open(os.path.join(_g, "src", "u.ts"), "w").write("export const u = 1\n")
+_idx, _head, _objs = _digest(os.path.join(_g, ".git", "index")), T.git(_g, "rev-parse", "HEAD").stdout, _objects(_g)
+_s1 = ledger.git_state(_g)
+T.expect("P10 git_state: a git repo gives head plus a 40-hex tree hash", _s1 and len(_s1.get("status") or "") == 40 and _s1["head"] == _head.strip(), str(_s1))
+T.expect("P10 git_state: the same tree hashes the same", ledger.git_state(_g) == _s1)
+T.expect("P10 git_state: the repo's index is byte-identical, HEAD unchanged, no object written",
+         _digest(os.path.join(_g, ".git", "index")) == _idx and T.git(_g, "rev-parse", "HEAD").stdout == _head and _objects(_g) == _objs)
+T.expect("P10 git_state: ...and the throwaway index left nothing staged in the real one", T.git(_g, "diff", "--cached", "--name-only").stdout.strip() == "")
+open(os.path.join(_g, "src", "a.ts"), "a").write("// edited again, same status line\n")
+T.expect("P10 git_state: an already-modified tracked file edited again changes the hash", ledger.git_state(_g)["status"] != _s1["status"])
+_s2 = ledger.git_state(_g)
+open(os.path.join(_g, "src", "u.ts"), "w").write("export const u = 2\n")
+T.expect("P10 git_state: an untracked file edited (same `??` line) changes the hash", ledger.git_state(_g)["status"] != _s2["status"])
+_s3 = ledger.git_state(_g)
+os.makedirs(os.path.join(_g, "scratch")); open(os.path.join(_g, "scratch", "n.ts"), "w").write("x\n")
+os.makedirs(os.path.join(_g, "src", "__pycache__")); open(os.path.join(_g, "src", "__pycache__", "m.cpython-312.pyc"), "wb").write(b"\x00\x01")
+T.expect("P10 git_state: git-ignored files and __pycache__/*.pyc are left out", ledger.git_state(_g)["status"] == _s3["status"])
+# A clean tracked file edited to the same size within the same second as the index refresh is stat-identical
+# to its index entry (git compares times to the second here). Copying the repo's index let git trust that stat
+# and skip re-reading the file, so the edit passed the gate about 1 run in 6 (audit case F3, measured on 0.6.0,
+# 2026-11-09). The edit lands in the refresh's second and the gate runs in the next one, every time.
+import time as _time  # noqa: E402
+_hit = None
+for _try in range(20):
+    _r = T.git_init(T.tree({"src/index.ts": "export const x = 1\n"}))
+    _p = os.path.join(_r, "src", "index.ts")
+    _sec = int(_time.time())
+    T.git(_r, "update-index", "--refresh")
+    _before = ledger.git_state(_r)
+    open(_p, "w").write("export const x = 9\n")  # same byte length
+    if int(os.stat(_p).st_mtime) == _sec and int(_time.time()) == _sec:
+        while int(_time.time()) == _sec:  # the gate runs in a later second, so its copied index looks newer
+            _time.sleep(0.05)
+        _hit = ledger.git_state(_r)["status"] != _before["status"]
+        break
+T.expect("P10 git_state: a same-size edit in the same second as the index refresh still changes the hash (F3)",
+         _hit is True, "reached the same second: %s" % (_hit is not None))
+open(os.path.join(_g, "src", "__pycache__", "evil.ts"), "w").write("x\n")
+T.expect("P10 git_state: ...but any other file under __pycache__/ counts", ledger.git_state(_g)["status"] != _s3["status"])
+os.remove(os.path.join(_g, "src", "__pycache__", "evil.ts"))
+_led = os.path.join(_g, "out", "findings.json")
+os.makedirs(os.path.dirname(_led)); open(_led, "w").write("{}")
+_s4 = ledger.git_state(_g, exclude=[_led])
+open(_led, "w").write('{"git": "rewritten"}')
+T.expect("P10 git_state: an excluded path (the ledger itself) does not count", ledger.git_state(_g, exclude=[_led]) == _s4 and _s4["status"] == _s3["status"])
+T.expect("P10 git_state: ...and without the exclusion it does", ledger.git_state(_g)["status"] != _s4["status"])
+_env = dict(os.environ, GIT_INDEX_FILE=os.path.join(T.tree({}), "hook-index"))
+_r = subprocess.run([sys.executable, "-c", "import sys; sys.path.insert(0, %r); import ledger, json; print(json.dumps(ledger.git_state(%r, exclude=[%r])))"
+                     % (os.path.join(HERE, "..", "lib"), _g, _led)], capture_output=True, text=True, env=_env)
+T.expect("P10 git_state: an inherited GIT_INDEX_FILE (a hook's) neither changes the hash nor gets written",
+         _r.returncode == 0 and json.loads(_r.stdout) == _s4 and not os.path.exists(_env["GIT_INDEX_FILE"]), _r.stdout + _r.stderr[-300:])
+T.expect("P10 git_state: outside git it is None", ledger.git_state(T.tree({"a.txt": "x"})) is None)
+
+# inventory: deploy configs at any depth and under any name, never from sample folders
+sys.path.insert(0, S)
+import inventory  # noqa: E402
+T.expect("P10 inventory: a named fly config (fly.staging.toml) in a service folder is fly",
+         "fly" in inventory.detect_stack(T.tree({"svc/api/fly.staging.toml": "app = 'a'\n"}))[0])
+T.expect("P10 inventory: ...a fly.toml under examples/ is a sample, not fly",
+         "fly" not in inventory.detect_stack(T.tree({"examples/deploy/fly.toml": "app = 'a'\n", "package.json": "{}"}))[0])
+T.expect("P10 inventory: railway.toml under a test folder still deploys",
+         "railway" in inventory.detect_stack(T.tree({"test/smoke/railway.toml": "[deploy]\n"}))[0])
+T.expect("P10 inventory: ...railway.json under docs/ does not",
+         "railway" not in inventory.detect_stack(T.tree({"docs/railway.json": "{}"}))[0])
+T.expect("P10 inventory: a supabase/ project four folders down is supabase",
+         "supabase" in inventory.detect_stack(T.tree({"a/b/c/d/supabase/config.toml": "project_id = 'x'\n"}))[0])
+T.expect("P10 inventory: ...a supabase/ under docs/ is a sample",
+         "supabase" not in inventory.detect_stack(T.tree({"docs/guide/supabase/migrations/1.sql": "select 1;\n"}))[0])
+# Audit 2026-11-07: a hook's inherited GIT_DIR / GIT_WORK_TREE / GIT_INDEX_FILE must not redirect git_state
+# to the hook's repo (it returned repo A's HEAD and tree for repo B with no error).
+_ha = T.git_init(T.tree({"a.txt": "repo A\n"}))
+_hb = T.git_init(T.tree({"b.txt": "repo B\n"}))
+_want_b = ledger.git_state(_hb)
+_saved = {k: os.environ.get(k) for k in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE")}
+os.environ.update(GIT_DIR=os.path.join(_ha, ".git"), GIT_WORK_TREE=_ha, GIT_INDEX_FILE=os.path.join(_ha, ".git", "index"))
+try:
+    _got_b = ledger.git_state(_hb)
+finally:
+    for _k, _v in _saved.items():
+        if _v is None:
+            os.environ.pop(_k, None)
+        else:
+            os.environ[_k] = _v
+T.expect("P10 git_state: an inherited hook GIT_DIR/GIT_WORK_TREE does not redirect it to another repo", _got_b == _want_b and _got_b["head"] != ledger.git_state(_ha)["head"], "%s vs %s" % (_got_b, _want_b))
+# ---- end Phase 10 supply-core-gate ----
+
+# ---- Phase 10 platform-a ----
+# names.secret_name: camelCase/kebab names split like SNAKE_CASE; plural compound credential words; vendor browser keys.
+T.expect("P10 names: camelCase splits into segments (openaiApiKey, stripeSecretKey are secrets)", names.secret_name("openaiApiKey") and names.secret_name("stripeSecretKey"))
+T.expect("P10 names: ...and camelCase config stays config (keyboardLayout, sessionTokenTtlSeconds, model)", not any(names.secret_name(n) for n in ("keyboardLayout", "sessionTokenTtlSeconds", "model")))
+T.expect("P10 names: a plural compound credential is the credential set (ALLOWED_API_KEYS, SIGNING_KEYS, PASSWORDS)", all(names.secret_name(n) for n in ("ALLOWED_API_KEYS", "SIGNING_KEYS", "PASSWORDS")))
+T.expect("P10 names: ...a bare plural weak word is config (MAX_TOKENS, SORT_KEYS)", not names.secret_name("MAX_TOKENS") and not names.secret_name("SORT_KEYS"))
+T.expect("P10 names: compounds without the underscore (APITOKEN, ACCESSTOKEN) are secrets", names.secret_name("APITOKEN") and names.secret_name("SHOP_ACCESSTOKEN"))
+T.expect("P10 names: vendor browser keys are public only under a browser prefix", not names.secret_name("SENTRY_DSN", browser=True) and not names.secret_name("FIREBASE_API_KEY", browser=True) and names.secret_name("FIREBASE_API_KEY"))
+T.expect("P10 names: ...their server twins stay secrets in the browser too (ALGOLIA_ADMIN_KEY)", names.secret_name("ALGOLIA_ADMIN_KEY", browser=True) is True)
+# ---- end Phase 10 platform-a ----
+
+# ---- Phase 10 app-auth ----
+# surface.names_identity / refusal_condition / worker_methods: a refusal counts as an auth gate by WHO its
+# condition is about (operand by operand, not a word anywhere in the text), and a raw Worker's methods are read
+# from its own condition or block, never a two-line window.
+import surface  # noqa: E402
+_h = "const form = await request.json()\nconst row = await db.first(form.slug)\nconst visitor = c.get('visitor')\nconst flag = env.FEATURE_EDITS\n"
+T.expect("P10 surface: another object's field and the caller's own data are not identity (row.authored_by !== form.authored_by)",
+         not surface.names_identity("(row.authored_by !== form.authored_by)", _h))
+T.expect("P10 surface: ...nor a feature flag copied from env (flag)", not surface.names_identity("(!flag)", _h))
+T.expect("P10 surface: a name bound to a context read is identity whatever it is called (visitor = c.get(...))", surface.names_identity("(!visitor)", _h))
+T.expect("P10 surface: ...an access predicate call is identity (mayEditDoc(...))", surface.names_identity("(!(await mayEditDoc(c, id)))", _h))
+T.expect("P10 surface: ...a shared-secret env compare is identity, a flag env is not", surface.names_identity("(given !== env.OPS_KEY)", _h) and not surface.names_identity("(!env.READ_ONLY)", _h))
+_c = "if (!acct) {\n  a()\n  b()\n  c()\n  d()\n  return res.status(401).end()\n}\n"
+T.expect("P10 surface: the refusal's condition is its enclosing if, however many lines above",
+         surface.refusal_condition(_c, _c.index("401")) == "(!acct)")
+_p = "def f():\n    if not acct:\n        log()\n        raise HTTPException(401)\n    return 1\n"
+T.expect("P10 surface: ...and the Python if over an indented block", (surface.refusal_condition(_p, _p.index("401")) or "").strip() == "not acct")
+T.expect("P10 surface: ...None when the refusal sits in no branch", surface.refusal_condition("x()\nreturn deny(403)\n", 14) is None)
+def _wm(src, needle):
+    code = walk.strip_comments(src, "a.ts", strings=False)
+    return surface.worker_methods(src, code, src.index(needle))
+T.expect("P10 surface: worker methods come from a switch on the method inside the path block",
+         _wm("if (p.startsWith('/v1/docs/')) {\n  switch (req.method) {\n    case 'GET': return a()\n    case 'PUT': return b()\n  }\n}\n", "p.startsWith") == ["GET", "PUT"])
+T.expect("P10 surface: ...`method != 'GET'` is a write (ALL)", _wm("if (p.startsWith('/v1/docs/') && req.method != 'GET') { return b() }\n", "p.startsWith") == ["ALL"])
+T.expect("P10 surface: ...an enclosing method if counts",
+         _wm("if (req.method === 'PATCH') {\n  if (p.startsWith('/v1/docs/')) {\n    return b()\n  }\n}\n", "p.startsWith") == ["PATCH"])
+T.expect("P10 surface: ...the next line's method is not borrowed",
+         _wm("if (p.startsWith('/static/')) return assets()\nif (p.startsWith('/v1/docs/') && req.method === 'PUT') { return b() }\n", "p.startsWith('/static") == ["ANY"])
+# ---- end Phase 10 app-auth ----
+
+# ---- Phase 10 audit fixes (names) ----
+# names.secret_name: a connection-string name followed by variant words is the connection string (one home;
+# check_fly_supabase.env_secret is gone).
+T.expect("P10 names: DATABASE_URL_UNPOOLED and POSTGRES_URL_NON_POOLING are connection strings (FAIL shape)",
+         names.secret_name("DATABASE_URL_UNPOOLED") is True and names.secret_name("POSTGRES_URL_NON_POOLING") is True)
+T.expect("P10 names: ...a host or a non-database URL with a variant word is not (APP_URL_STAGING, DB_HOST_PRIMARY)",
+         names.secret_name("APP_URL_STAGING") is False and names.secret_name("DB_HOST_PRIMARY") is False)
+# ---- end Phase 10 audit fixes (names) ----
+
+# ---- Phase 10 audit fixes ----
+# surface: one request-input vocabulary (CALLER_INPUT_RX, and DATA_INPUT_RX without headers) and env names
+# judged by word segments (secret_env).
+T.expect("P10 audit: CALLER_INPUT_RX reads typed c.req.json<T>(), c.req.valid(), req.get() and req.headers[...]",
+         all(surface.CALLER_INPUT_RX.search(x) for x in ("await c.req.json<{ a: Array<string> }>()", "c.req.valid('form')", "req.get('x-device')", "req.headers['x-team']", "request.body")))
+T.expect("P10 audit: ...not the connecting address, a db.query() call or a cache.json() call",
+         not any(surface.CALLER_INPUT_RX.search(x) for x in ("req.headers['x-real-ip']", "request.headers.get('cf-connecting-ip')", "await db.query(sql)", "cache.json()")))
+T.expect("P10 audit: DATA_INPUT_RX is caller data without the credential-carrying headers",
+         surface.DATA_INPUT_RX.search("await c.req.json<Body>()") and not surface.DATA_INPUT_RX.search("c.req.header('authorization')"))
+T.expect("P10 audit: secret_env judges word segments: ADMIN_TOKEN, jwtSecret, PASSCODE are shared secrets",
+         all(surface.secret_env(n) for n in ("ADMIN_TOKEN", "jwtSecret", "PASSCODE", "EDITOR_API_KEY")))
+T.expect("P10 audit: ...ENABLE_AUTHOR_EDITS, ALLOW_ADMINISTRATION and SESSIONLESS_MODE are flags",
+         not any(surface.secret_env(n) for n in ("ENABLE_AUTHOR_EDITS", "ALLOW_ADMINISTRATION", "SESSIONLESS_MODE")))
+# ---- end Phase 10 audit fixes ----
+
 T.finish()

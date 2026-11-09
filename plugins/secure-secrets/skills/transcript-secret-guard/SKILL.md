@@ -1,6 +1,6 @@
 ---
 name: transcript-secret-guard
-description: "Keep secret values out of captured Claude sessions, which are git-tracked and pushed: a staged PreToolUse hook that blocks Bash commands known to print secrets (cat .dev.vars, printenv, railway variables without a count, gh auth token, echo $KEY, a key pasted into a command) and names the count-only form, plus a scanner that reports file:line for secrets already in the session capture folders without printing them. Use when the user says 'a key got into the transcript', 'scan the captures for keys', 'block commands that print secrets', or after any exposure. Do NOT use it to rotate the key (secret-rotation) or to scan a code repo (secret-scan)."
+description: "Keep secret values out of captured Claude sessions, which are git-tracked and pushed: a staged PreToolUse hook that blocks Bash commands known to print secrets (cat .dev.vars, printenv, railway variables without a count, gh auth token, wrangler auth token, a read of ~/.wrangler/config, echo $KEY, a key pasted into a command) and names the count-only form, plus a scanner that reports file:line for secrets already in the session capture folders without printing them. Use when the user says 'a key got into the transcript', 'scan the captures for keys', 'block commands that print secrets', or after any exposure. Do NOT use it to rotate the key (secret-rotation) or to scan a code repo (secret-scan)."
 metadata:
   workflow: true
 allowed-tools:

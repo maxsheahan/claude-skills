@@ -96,9 +96,9 @@ def run_check(plugin, script, repo, extra, timeout, blind):
         return [unknown("%s.%s.run" % (plugin, script[:-3]), "%s gave unusable output" % label, _scrub(str(exc)), label)]
 
 
-def _git_state(repo):
-    """HEAD and a hash of the working-tree status, so the gate can refuse a ledger from another commit."""
-    return ledger.git_state(repo)
+def _git_state(repo, exclude=()):
+    """HEAD and a hash of the working tree's content, so the gate can refuse a ledger from another commit or tree."""
+    return ledger.git_state(repo, exclude)
 
 
 def _scrub(text):
@@ -160,7 +160,9 @@ def main():
     led["complete"] = True
     json.dump(led, open(os.path.join(out, "findings.json"), "w"), indent=1)
     open(os.path.join(out, "findings.md"), "w").write(ledger.to_markdown(led))
-    led["git"] = _git_state(repo)  # taken AFTER every output file exists, so a default in-repo run (DIR inside REPO) fingerprints the tree the gate will see
+    # Taken AFTER every output file exists, so a default in-repo run (DIR inside REPO) hashes the tree the gate will
+    # see; findings.json itself is left out (it carries the binding), and the gate leaves out the ledger it reads.
+    led["git"] = _git_state(repo, exclude=[os.path.join(out, "findings.json")])
     json.dump(led, open(os.path.join(out, "findings.json"), "w"), indent=1)
     c = led["counts"]
     print("%s: %d FAIL, %d UNKNOWN, %d PASS -> %s" % (os.path.basename(repo), c["FAIL"], c["UNKNOWN"], c["PASS"], os.path.join(out, "findings.md")))

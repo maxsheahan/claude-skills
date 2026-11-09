@@ -8,10 +8,14 @@ Catches the mistakes that broke real rotations: a value that still carries its
 own "NAME=" prefix (ElevenLabs, 2026-10-06: a BSD sed kept the prefix and every
 call returned 401; a base64 value's trailing = padding is not a prefix),
 surrounding quotes left in, a trailing CR or space, an empty value, a
-placeholder (a word like test or changeme only under a secret-looking name, a
-shape like xxxx or <paste> under any name, and a provider prefix followed by a
-template's x's), or a provider prefix that does not match the name (an
-ANTHROPIC key that does not start sk-ant-; an sk-ant- key in an OPENAI slot).
+placeholder (a word like test, change-me, password or REPLACE_WITH_YOUR_KEY
+only under a secret-looking name, a shape like xxxx or <paste> under any name,
+and a provider prefix followed by a template's x's, as in AIzaSyXXXX), or a
+provider prefix that does not match the name (an ANTHROPIC key that does not
+start sk-ant-; an sk-ant- key in an OPENAI slot). A name is secret-looking by
+its words, never a substring: AUTH_MODE, KEYCLOAK_REALM, ANTHROPIC_BASE_URL and
+OPENAI_ORG_ID are settings, and only a secret-looking name is held to a
+provider prefix (Azure OpenAI keys are hex, so AZURE_OPENAI names are not).
 When several provider rules name one variable, the most specific wins, so a
 whsec_ value under STRIPE_WEBHOOK_SECRET is right. Values are read in-process
 and compared; output is the NAME, the file:line and the problem. Never the
@@ -28,18 +32,51 @@ import _corepath  # noqa: F401,E402
 import ledger  # noqa: E402
 from ledger import result  # noqa: E402
 
-# Placeholder WORDS (test, example, changeme, your-key-here) only mean "no real value" under a
-# name that looks like a secret: APP_ENV=test is a setting. Structural placeholders (<paste>,
-# ..., xxxx) are never a real value under any name.
-PLACEHOLDER_WORD = re.compile(r"^(your[-_ ].*|changeme|replace[-_ ]?me|todo|placeholder|example|test|dummy)$", re.I)
+# Placeholder WORDS (test, example, change-me, REPLACE_WITH_YOUR_KEY, password) only mean "no real
+# value" under a name that looks like a secret: APP_ENV=test is a setting. The value is compared
+# with its case and its - _ . and space separators removed, and only when what is left is letters
+# alone (a real secret carries a digit). Structural placeholders (<paste>, ..., xxxx) are never a
+# real value under any name.
+PLACEHOLDER_WORD = re.compile(r"^(your\w*|replace(me|this|with\w*)?|change(me|this|it)|todo|tbd|fixme|placeholder|example|test|dummy|"
+                              r"sample|password|passwd|secret|redacted|(insert|enter|paste|put|add)\w*here|\w*goeshere)$")
 PLACEHOLDER_SHAPE = re.compile(r"^(x{3,}|<.*>|\.\.\.|\*{3,})$", re.I)
-SECRET_NAME = re.compile(r"(?i)(key|secret|token|passw|pwd|credential|auth|private|salt|dsn)")
+# A name is secret-looking by its WORDS, never a substring (KEYCLOAK_REALM holds no KEY word):
+# its last word is a credential noun, or some word is one and the last word is not a setting noun
+# (AUTH_MODE, ANTHROPIC_BASE_URL, OPENAI_ORG_ID and KEY_FILE are settings).
+SECRET_TAIL = {"key", "keys", "secret", "token", "password", "passwd", "pass", "pwd", "credential", "credentials", "salt", "dsn",
+               "pat", "sk", "apikey", "auth", "pem"}
+SECRET_WORDS = {"key", "secret", "token", "password", "passwd", "pwd", "credential", "credentials", "private", "salt", "apikey", "auth"}
+SETTING_TAIL = {"mode", "url", "uri", "host", "hostname", "port", "env", "realm", "name", "region", "org", "path", "file", "dir",
+                "type", "enabled", "ttl", "timeout", "version", "length", "level", "header", "endpoint", "scope", "scopes", "provider",
+                "algorithm", "alg", "format", "issuer", "audience"}
+
+
+def name_words(name):
+    """STRIPE_SECRET_KEY, apiKey -> lowercase words."""
+    out = []
+    for part in re.split(r"[^A-Za-z0-9]+", name):
+        out += [w.lower() for w in re.findall(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|\d+", part)]
+    return out
+
+
+def secret_named(name):
+    words = name_words(name)
+    if not words:
+        return False
+    if words[-1] in SECRET_TAIL:
+        return True
+    return any(w in SECRET_WORDS for w in words) and words[-1] not in SETTING_TAIL
+
+
+def placeholder_word(v):
+    flat = re.sub(r"[-_ .]", "", v).lower()
+    return flat.isalpha() and bool(PLACEHOLDER_WORD.match(flat))
 # (name pattern, required value regex, label). When several name patterns match one NAME, the most
 # specific wins: the pattern that spells out the most letters of the name (STRIPE.*WEBHOOK beats
 # STRIPE.*SECRET for STRIPE_WEBHOOK_SECRET). A rule is never chosen by list position alone.
 PREFIX = [
     (r"ANTHROPIC", r"sk-ant-", "Anthropic keys start sk-ant-"),
-    (r"OPENAI", r"sk-(?!ant-)", "OpenAI keys start sk- (sk-ant- is an Anthropic key)"),
+    (r"^(?!.*AZURE).*OPENAI", r"sk-(?!ant-)", "OpenAI keys start sk- (sk-ant- is an Anthropic key)"),  # Azure OpenAI keys are hex
     (r"STRIPE.*SECRET", r"[sr]k_(live|test)_", "Stripe secret keys start sk_live_/sk_test_ (or rk_)"),
     (r"STRIPE_SK", r"[sr]k_(live|test)_", "Stripe secret keys start sk_live_/sk_test_ (or rk_)"),
     (r"STRIPE_KEY", r"[sr]k_(live|test)_", "Stripe secret keys start sk_live_/sk_test_ (or rk_)"),
@@ -61,29 +98,37 @@ def _specificity(name_pattern):
 
 
 def prefix_rule(name):
-    """The most specific PREFIX rule whose name pattern matches NAME, or None."""
+    """The most specific PREFIX rule whose name pattern matches NAME, or None. Only a
+    secret-looking NAME is held to a provider prefix: ANTHROPIC_BASE_URL is a URL."""
+    if not secret_named(name):
+        return None
     hits = [rule for rule in PREFIX if re.search(rule[0], name, re.I)]
     return max(hits, key=lambda rule: _specificity(rule[0])) if hits else None
 
 
 def is_placeholder(name, v):
     """Shape placeholders under any name; word placeholders only under a secret-looking name;
-    a provider prefix followed by nothing but a template's x's or dots under either."""
+    a provider prefix followed by a template's fill (x's, dots or stars, with at most a few
+    other characters such as the Sy of AIzaSy) under either."""
     if PLACEHOLDER_SHAPE.match(v):
         return True
-    if SECRET_NAME.search(name) and PLACEHOLDER_WORD.match(v):
+    if secret_named(name) and placeholder_word(v):
         return True
     head = PROVIDER_HEAD.match(v)
     if head:
         rest = v[head.end():]
-        if not rest or PLACEHOLDER_SHAPE.match(rest) or PLACEHOLDER_WORD.match(rest) or len(set(rest.lower())) == 1:
+        if not rest or PLACEHOLDER_SHAPE.match(rest) or placeholder_word(rest) or len(set(rest.lower())) == 1:
+            return True
+        if len(rest) >= 8 and len(re.sub(r"[xX*.]", "", rest)) <= 4:
             return True
     return False
 
 
-# A value that still carries its own NAME= prefix: an env-style name, "=", then MORE value. The "="
-# that ends a base64 value (padding, followed by nothing or another "=") is not a prefix.
-OWN_NAME_PREFIX = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=(?!=*$)")
+# A value that still carries a NAME= prefix: an UPPER_SNAKE env name (its own or another one) and
+# "=", whatever follows, even nothing (MY_TOKEN= pasted whole); or any identifier, "=", then more
+# value. The "=" that ends a mixed-case base64 value (padding, then nothing or another "=") is
+# not a prefix.
+OWN_NAME_PREFIX = re.compile(r"^(?:[A-Z][A-Z0-9]*_[A-Z0-9_]*=|[A-Za-z_][A-Za-z0-9_]*=(?!=*$))")
 
 
 def check_file(path):
@@ -111,7 +156,7 @@ def check_file(path):
             problems.append("unbalanced quote")
         if not v:
             problems.append("empty value")
-        elif OWN_NAME_PREFIX.match(v):
+        elif OWN_NAME_PREFIX.match(v) or v.startswith(name + "="):
             problems.append("value starts with its own NAME= prefix")
         elif is_placeholder(name, v):
             problems.append("placeholder, not a real value")

@@ -3,6 +3,7 @@ and the app-layer checks, so both read a handler the same way."""
 import os
 import re
 
+import names as _names
 import walk
 
 PAID_HOSTS = {
@@ -36,19 +37,48 @@ PY_ROUTE_RX = re.compile(r"""@\w+\.(get|post|put|patch|delete|route|api_route)\(
 WORKER_PATH_RX = re.compile(r"""(?:pathname|url\.pathname|path)\s*(?:===|==|\.startsWith\()\s*['"`](/[^'"`]*)['"`]""")
 # request.method === 'DELETE' / req.method == "POST" / method === 'PUT' on the same condition as a pathname test
 WORKER_METHOD_RX = re.compile(r"""\bmethod\s*(?:===|==)\s*['"](GET|POST|PUT|PATCH|DELETE)['"]""", re.I)
-AUTH_RX = re.compile(r"requireAuth|requireUser|requireAdmin|requireSession|getSession|getServerSession|auth\(\)|currentUser|verifySession|readSession|sessionFrom|getUser\(|isAdmin|jwtVerify|Cf-Access-Jwt-Assertion|ownerId|owner_id|user_id\s*=|passcode|checkPasscode|withAuth|authMiddleware|ensureSignedIn|signedInUser|userFromRequest|userSpace|requireOwner|\b40[13]\b\s*\)|status\(\s*40[13]\s*\)|status:\s*40[13]\b|Unauthorized|Forbidden|SIGN_IN_REQUIRED|Depends\(\s*\w*(?:auth|user|session|verify)\w*|HTTPException\(\s*(?:status_code\s*=\s*)?40[13]\b|login_required|@requires_auth", re.I)
+AUTH_RX = re.compile(r"requireAuth|requireUser|requireAdmin|requireSession|getSession|getServerSession|auth\(\)|currentUser|verifySession|readSession|sessionFrom|getUser\(|isAdmin|jwtVerify|Cf-Access-Jwt-Assertion|ownerId|owner_id|user_id\s*=|passcode|checkPasscode|withAuth|authMiddleware|ensureSignedIn|signedInUser|userFromRequest|userSpace|requireOwner|\b40[13]\b\s*,?\s*\)|status\(\s*40[13]\s*\)|status:\s*40[13]\b|Unauthorized|Forbidden|SIGN_IN_REQUIRED|Depends\(\s*\w*(?:auth|user|session|verify)\w*|HTTPException\(\s*(?:status_code\s*=\s*)?40[13]\b|login_required|@requires_auth", re.I)
 # The AUTH_RX alternatives that name only a refusal, not who is being refused: a 401/403 or a
 # Forbidden/Unauthorized identifier. These gate a handler only when the condition that triggers
 # them speaks of identity (auth_ref); `if (note.locked) return 403` refuses locked notes, not strangers.
-STATUS_ONLY_RX = re.compile(r"^(?:\b40[13]\b\s*\)|status\(\s*40[13]\s*\)|status:\s*40[13]\b|Unauthorized|Forbidden|HTTPException\(\s*(?:status_code\s*=\s*)?40[13]\b)$", re.I)
+STATUS_ONLY_RX = re.compile(r"^(?:\b40[13]\b\s*,?\s*\)|status\(\s*40[13]\s*\)|status:\s*40[13]\b|Unauthorized|Forbidden|HTTPException\(\s*(?:status_code\s*=\s*)?40[13]\b)$", re.I)
 IDENTITY_WORD_RX = re.compile(r"user|session|auth|owner|token|login|logged|signed|identity|principal|account|member|admin|role|perm|allow|email|claim|jwt|\bsub\b|\buid\b|tenant|caller|actor|\bme\b|\bkey\b|secret|passcode|verif|can[A-Z]\w*|is(?:Owner|Admin|Allowed|Authori[sz]ed|Member|Mine)|teacher|student", re.I)
 # Ownership identifiers that AUTH_RX credits; worthless when the caller supplies them (ownerId from the JSON body)
 OWNER_ID_RX = re.compile(r"\b(?:ownerId|owner_id|user_id|userId|accountId|tenantId)\b")
-REQ_SOURCE_RX = re.compile(r"c\.req\.(?:json|parseBody|formData|query|queries|param|header)\(|req(?:uest)?\.(?:body|query|params|headers)\b|request\.(?:json|formData|text)\(|\b(?:body|payload|input|params)\b|searchParams\.get\(")
 CAP_RX = re.compile(r"(spend|budget|cost|usage|daily|monthly)[_\- ]?(cap|limit|ceiling|max)|max[_\-]?(spend|cost|usd|dollars)|free[_\-]?(uses|limit|walks)|\bquota\b"
                     r"|MAX_[A-Z_]*_PER_(?:RUN|DAY|REQUEST|HOUR)|(?:score|call|request|token)Limit\b|SPEND_CUTOFF|\w*_BUDGET\b|Budget(?:Exceeded|Error)\b", re.I)
-# searchParams.get( with or without a receiver: `const { searchParams } = new URL(req.url)` destructures it (Phase 8)
-REQ_INPUT_RX = re.compile(r"c\.req\.(?:query|param|queries|json|parseBody|formData|header)\(|\bsearchParams\.get\(|req\.(?:query|params|body)\b|request\.(?:json|formData|text)\(\)|await\s+c\.req\.json\(\)|\bctx\.params\b|context\.params\b")
+# ---- where caller input enters a handler: ONE vocabulary (Phase 10 audit, 2026-11-07) ----
+# Five overlapping request-input regexes (REQ_SOURCE_RX, REQ_INPUT_RX, REQ_SOURCE_BASE, DATA_INPUT_RX,
+# CALLER_INPUT_RX) and two local REQ_EXTRA copies in check_spend and check_fetch disagreed on spellings, so a
+# form one check knew another missed (Hono's typed c.req.json<T>() was in none of them). The forms live here
+# once. Two readings remain because their meanings differ:
+#   CALLER_INPUT_RX  everything the caller chooses: body, query, path params, form fields, and request
+#                    headers other than the connecting address the edge sets (cf-connecting-ip, x-real-ip,
+#                    x-forwarded-for). Use it to ask "did this value come from the request?".
+#   DATA_INPUT_RX    the same minus every header. Use it only where a header is a credential CARRIER, not
+#                    data: `const token = c.req.header('authorization'); if (!token) return 401` refuses a
+#                    caller with no credential, so a binding from a header must not read as "the caller's
+#                    own data" in the identity judgment (_bound_elsewhere, WHOLE_INPUT_RX).
+# CALLER_SUPPLIED_RX (below) is a third, deliberately wider and case-insensitive reading for a value already
+# known to be a limiter key component; it is never used to find where input enters.
+# A TypeScript type argument may sit between the accessor and its call: c.req.json<{ link: string }>().
+_CALL = r"(?:\s*<[^()\n;]{0,200}?>)?\s*\("
+_CONNECTING = r"""['"](?:cf-connecting-ip|x-real-ip|x-forwarded-for)['"]"""
+_DATA_FORMS = (
+    r"\bc\.req\.(?:json|parseBody|formData|query|queries|param|text|valid)" + _CALL,  # Hono, incl. validated c.req.valid('json')
+    r"\b(?:req|request)\.(?:json|formData|text)" + _CALL,          # Fetch API Request, Next req.json()
+    r"\b(?:req|request)\.(?:body|query|params)\b",                 # Express, Fastify
+    r"\bctx\.request\.(?:body|query)\b|\bctx\.(?:query|params)\b|\bcontext\.params\b",  # Koa, Next route context
+    r"\bsearchParams\.get\(|\bformData\.get\(|\bevent\.body\b",    # with or without a receiver; Lambda events
+    r"\brequest\.get_json\(|\brequest\.(?:form|args|json|values|query_params|path_params)\b",  # Flask, Starlette
+)
+_HEADER_FORMS = (
+    r"\bc\.req\.header\(\s*(?!%s)" % _CONNECTING,
+    r"\breq\.(?:get|header)\(\s*(?!%s)" % _CONNECTING,             # Express req.get('x-device')
+    r"\b(?:req|request)\.headers\b(?!\s*(?:\[\s*|\.get\(\s*)%s)" % _CONNECTING,
+)
+DATA_INPUT_RX = re.compile("|".join(_DATA_FORMS))
+CALLER_INPUT_RX = re.compile("|".join(_DATA_FORMS + _HEADER_FORMS))
 FILE_ROUTE_RX = [re.compile(r"(?:^|/)app/(.*)/route\.(?:ts|js|tsx|jsx)$"), re.compile(r"(?:^|/)pages/(api/.*)\.(?:ts|js)$"),
                  re.compile(r"(?:^|/)functions/(.*)\.(?:ts|js)$")]
 FETCH_RX = re.compile(r"""\b(?:fetch|axios(?:\.(?:get|post|put|request))?|got|ky|https?\.(?:get|request))\(\s*([^,\)\n]{1,160})""")
@@ -70,7 +100,8 @@ def handlers(repo, served=True):
         t = walk.read_code(p)
         r = walk.rel(repo, p)
         lines = t.splitlines()
-        code_lines = walk.read_code(p, strings=False).splitlines()
+        code_text = walk.read_code(p, strings=False)
+        code_lines = code_text.splitlines()
         found = [(m, "ROUTE") for m in ROUTE_RX.finditer(t)] + [(m, "WORKER") for m in WORKER_PATH_RX.finditer(t)]
         if r.endswith(".py"):
             found += [(m, "PY") for m in PY_ROUTE_RX.finditer(t)]
@@ -88,14 +119,13 @@ def handlers(repo, served=True):
                     meth = (re.findall(r"[A-Z]+", (m.group(3) or "GET").upper()) or ["GET"])[0]
                 yield {"file": r, "line": ln, "method": meth, "path": m.group(2), "body": body, "code": code}
             else:
-                # a raw fetch handler: the method is whatever the same condition compares request.method to,
-                # and startsWith('/api/notes/') is a prefix with something after it, written /api/notes/*
-                cond = "\n".join(lines[ln - 1: ln + 1])
-                mm = WORKER_METHOD_RX.search(cond)
+                # a raw fetch handler: startsWith('/api/notes/') (or '/api/notes') is a prefix with something
+                # after it, written /api/notes/*; the methods come from worker_methods()
                 path = m.group(1)
-                if "startsWith" in m.group(0) and path.endswith("/"):
-                    path += "*"
-                yield {"file": r, "line": ln, "method": mm.group(1).upper() if mm else "ANY", "path": path, "body": body, "code": code}
+                if "startsWith" in m.group(0):
+                    path = path.rstrip("/") + "/*"
+                for meth in worker_methods(t, code_text, m.start()):
+                    yield {"file": r, "line": ln, "method": meth, "path": path, "body": body, "code": code}
         for rx in FILE_ROUTE_RX:
             fm = rx.search(r)
             if fm:
@@ -105,6 +135,91 @@ def handlers(repo, served=True):
                 for meth in ms:
                     yield {"file": r, "line": 1, "method": meth, "path": path, "body": t, "code": "\n".join(code_lines)}
                 break
+
+
+METHOD_NE_RX = re.compile(r"""\bmethod\s*(?:!==|!=)\s*['"](GET|POST|PUT|PATCH|DELETE)['"]""", re.I)
+SWITCH_METHOD_RX = re.compile(r"""\bswitch\s*\(\s*[\w$.]*method\s*\)""")
+IF_RX = re.compile(r"\bif\s*\(")
+CASE_RX = re.compile(r"""\bcase\s+['"](GET|POST|PUT|PATCH|DELETE)['"]\s*:""", re.I)
+
+
+def _cond_methods(cond):
+    ne = METHOD_NE_RX.findall(cond)
+    if ne:
+        return ["ALL"]  # `method !== 'GET'`: every other method, writes included
+    return sorted({x.upper() for x in WORKER_METHOD_RX.findall(cond)})
+
+
+def _block_methods(t, code, k):
+    """Methods a block at code[k] == '{' dispatches on: nested `if (method === 'X')` and switch/case."""
+    end = walk.block_end(code, k)
+    seg = t[k:end] if end else t[k:k + 6000]
+    out = {x.upper() for x in WORKER_METHOD_RX.findall(seg)}
+    for sw in SWITCH_METHOD_RX.finditer(code, k, end or k + 6000):
+        bk = code.find("{", sw.end())
+        be = walk.block_end(code, bk) if bk >= 0 else None
+        out |= {x.upper() for x in CASE_RX.findall(t[bk:be or bk + 6000])}
+    if METHOD_NE_RX.search(seg):
+        out.add("ALL")
+    return sorted(out)
+
+
+def worker_methods(t, code, pos):
+    """The methods a raw fetch handler serves for the path test at pos (Phase 10): the method compared in
+    the same `if` condition (`&& request.method === 'DELETE'`, `!== 'GET'`), else the methods its block
+    dispatches on (nested ifs, switch (request.method)), else a method test on an enclosing `if`. Read
+    by balanced parens and braces, never a line window: the next route's condition is not this one's.
+    `t` keeps strings (the method literals), `code` blanks them (the structure); positions agree."""
+    prev = t.rfind("\n", 0, max(0, t.rfind("\n", 0, pos)))
+    for b in reversed(list(IF_RX.finditer(code, max(0, prev), pos))):
+        j = code.find("(", b.start())
+        ce = _paren_end(code, j)
+        if ce is None or ce <= pos:
+            continue
+        ms = _cond_methods(t[j:ce])
+        if ms:
+            return ms
+        k = ce
+        while k < len(code) and code[k] in " \t\n":
+            k += 1
+        if k < len(code) and code[k] == "{":
+            ms = _block_methods(t, code, k)
+            if ms:
+                return ms
+        else:
+            ms = _cond_methods(t[k:_statement_end(code, k)])
+            if ms:
+                return ms
+        # an enclosing `if (request.method === 'DELETE') { if (pathname...) {...} }`
+        depth, j2 = 0, b.start()
+        for _ in range(3):
+            while j2 > 0:
+                j2 -= 1
+                ch = code[j2]
+                if ch == "}":
+                    depth += 1
+                elif ch == "{":
+                    if depth == 0:
+                        break
+                    depth -= 1
+            if j2 <= 0:
+                break
+            l1 = code.rfind("\n", 0, j2)
+            hs0 = code.rfind("\n", 0, l1) if l1 > 0 else -1
+            head = code[max(0, hs0):j2]  # the opening brace's line and the one above it
+            hm = list(re.finditer(r"\bif\s*\(", head))
+            if hm:
+                hs = j2 - len(head) + hm[-1].start()
+                hj = code.find("(", hs)
+                he = _paren_end(code, hj)
+                if he and he <= j2:
+                    ms = _cond_methods(t[hj:he])
+                    if ms:
+                        return ms
+        break
+    ls = t.rfind("\n", 0, pos) + 1
+    le = t.find("\n", pos)
+    return _cond_methods(t[ls:le if le >= 0 else len(t)]) or ["ANY"]
 
 
 def auth_ref(code):
@@ -119,28 +234,203 @@ def auth_ref(code):
       notes, not strangers.
     `code` is the handler text with comments AND strings blanked (surface.handlers()['code']).
     Other callers of AUTH_RX (the inventory's route map) keep the wider reading on purpose."""
+    # body / payload / input / params are caller input by convention, unless THIS handler binds the name to
+    # something else: `const payload = await verifyToken(cookie)` is a verified token (Phase 10)
+    conv = [n for n in CONVENTIONAL_INPUT if not _bound_elsewhere(n, code)]
+    req_src = CALLER_INPUT_RX.pattern + ("|\\b(?:%s)\\b" % "|".join(conv) if conv else "")
     for name in set(OWNER_ID_RX.findall(code)):
-        sourced = (re.search(r"\{[^}]*\b%s\b[^}]*\}\s*=\s*(?:await\s+)?(?:%s)" % (re.escape(name), REQ_SOURCE_RX.pattern), code)
-                   or re.search(r"\b%s\s*=\s*(?:await\s+)?(?:%s)" % (re.escape(name), REQ_SOURCE_RX.pattern), code)
-                   or re.search(r"\b(?:body|payload|input|params|req\.body|req\.query|req\.params)\.%s\b" % re.escape(name), code))
+        sourced = (re.search(r"\{[^}]*\b%s\b[^}]*\}\s*=\s*(?:await\s+)?(?:%s)" % (re.escape(name), req_src), code)
+                   or re.search(r"\b%s\s*=\s*(?:await\s+)?(?:%s)" % (re.escape(name), req_src), code)
+                   or re.search(r"\b(?:%s)\.%s\b" % ("|".join(conv + [r"req\.body", r"req\.query", r"req\.params"]), re.escape(name)), code))
         if sourced:
             code = re.sub(r"\b%s\b" % re.escape(name), " " * len(name), code)
     for m in AUTH_RX.finditer(code):
         if not STATUS_ONLY_RX.match(m.group(0)):
             return m
-        # the condition that leads to this refusal: from the nearest `if (` / `if ...:` within three lines
-        start = code.rfind("\n", 0, m.start())
-        for _ in range(3):
-            start = code.rfind("\n", 0, max(0, start))
-            if start <= 0:
-                start = 0
-                break
-        window = code[start: m.start()]
-        ifs = list(re.finditer(r"\b(?:if|elif|else\s+if|unless|guard|catch)\b", window))
-        cond = window[ifs[-1].start():] if ifs else window
-        if IDENTITY_WORD_RX.search(cond):
+        # the condition that leads to this refusal: the `if` (or `catch`'s try) whose consequent holds it
+        cond = refusal_condition(code, m.start())
+        if cond is None:  # no enclosing branch: a ternary or `x || refuse()` on the lines just above
+            start = code.rfind("\n", 0, m.start())
+            for _ in range(3):
+                start = code.rfind("\n", 0, max(0, start))
+                if start <= 0:
+                    start = 0
+                    break
+            cond = code[start: m.start()]
+        if names_identity(cond, code):
             return m
     return None
+
+
+# ---- does a refusal's condition speak of WHO the caller is? (Phase 10, 2026-11-07) ----
+# A word test on the condition text credited `post.author !== body.author` (author contains auth),
+# `team.member_count >= 50`, `!body.email` and `!c.env.ALLOW_WRITES`, and missed `!viewer`, `!who` and
+# `!payload` bound from c.get() or a verify call. The condition is now read operand by operand: each root
+# identifier is identity when it is a request object's identity member (req.user, c.get(...), the
+# Authorization header), a name bound in the handler to a context read or an identity call, a name that
+# itself names identity (user, session, ownerId) and is not bound to caller data, an access predicate call
+# (hasAccess(...), canEdit(...)), or a shared-secret env var (env.ADMIN_TOKEN). A property of some other
+# object (post.author, team.member_count), caller data (body.email) and a feature flag (env.ALLOW_WRITES) are not.
+CONVENTIONAL_INPUT = ("body", "payload", "input", "params")
+# the value is wholly the request's: `await c.req.json()`, `Schema.parse(await req.json())`, `body`, `body.x`
+WHOLE_INPUT_RX = re.compile(r"(?:await\s+)?(?:[\w$.]*(?:parse|safeParse|validate)\w*\s*\(\s*)?(?:await\s+)?(?:%s|(?:%s)\b)" % (DATA_INPUT_RX.pattern, "|".join(CONVENTIONAL_INPUT)))
+ENV_VALUE_RX = re.compile(r"(?:[\w$]+\.)*env\.([\w$]+)|os\.environ(?:\.get\(|\[)")
+# A shared-secret env var is judged by its name's WORD SEGMENTS, never substrings: ENABLE_AUTHOR_EDITS holds
+# AUTH and ALLOW_ADMINISTRATION holds ADMIN, yet both are feature flags. A credential-shaped name
+# (names.secret_name: ADMIN_TOKEN, API_KEY, JWT_SECRET) or a segment in SHARED_SECRET_SEGMENTS counts.
+SHARED_SECRET_SEGMENTS = {"TOKEN", "SECRET", "PASSWORD", "PASS", "PASSCODE", "KEY", "APIKEY", "JWT", "CREDENTIAL", "CREDENTIALS"}
+
+
+def secret_env(name):
+    """True when an env var NAME is a shared secret a caller can be checked against (not a feature flag)."""
+    return bool(name) and (_names.secret_name(name) or bool(set(_names._segments(name)) & SHARED_SECRET_SEGMENTS))
+
+
+# reads of what a middleware or the framework established about the caller
+CONTEXT_IDENTITY_RX = re.compile(r"\bc\.get\(|\bc\.var\.|\bctx\.state\b|\b(?:req|request)\.(?:user|session|auth)\b|\blocals\.|\bgetCookie\(|\bcookies\(\)|\.cookies\b|\bauthorization\b|\bDepends\(", re.I)
+ACCESS_CALL_RX = re.compile(r"^(?:has|can|may)[A-Z]|access|acl|authori[sz]|allowed|permit|verif|decode", re.I)
+REQUEST_ROOTS = {"c", "ctx", "req", "request", "event", "context", "res", "reply", "locals"}
+REQUEST_IDENTITY_MEMBERS = {"get", "var", "state", "locals", "user", "session", "auth", "account", "principal", "identity", "viewer", "member", "cookies"}
+KEYWORDS = {"if", "elif", "else", "await", "return", "typeof", "new", "null", "undefined", "true", "false", "not", "and", "or", "is",
+            "None", "True", "False", "in", "instanceof", "throw", "const", "let", "var", "unless", "guard", "void", "delete", "of"}
+ROOT_RX = re.compile(r"(?<![\w$.])(?<!\.\s)(?<!\?\.)([A-Za-z_$][\w$]*)((?:\s*\??\.\s*[A-Za-z_$][\w$]*)*)(\s*\()?")
+BRANCH_RX = re.compile(r"\b(?:if|elif|unless|guard|catch)\b")
+COND_LOOKBACK = 15  # lines above a refusal searched for the branch that leads to it
+
+
+def _bound_elsewhere(name, code):
+    """True when the handler binds `name` to something other than caller input."""
+    src = walk.decl_src(name, code)
+    return bool(src) and not DATA_INPUT_RX.search(src)
+
+
+def _paren_end(code, i):
+    """Index just past the `)` that balances the `(` at i, or None."""
+    depth = 0
+    for j in range(i, min(len(code), i + 4000)):
+        depth += (code[j] == "(") - (code[j] == ")")
+        if depth == 0:
+            return j + 1
+    return None
+
+
+def _statement_end(code, i):
+    """End of the brace-less statement starting at i: the first `;` or newline outside brackets."""
+    depth = 0
+    for j in range(i, min(len(code), i + 4000)):
+        ch = code[j]
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            if depth == 0:
+                return j
+            depth -= 1
+        elif ch in ";\n" and depth == 0 and code[i:j].strip():
+            return j
+    return len(code)
+
+
+def refusal_condition(code, pos):
+    """The condition text of the nearest branch whose consequent holds pos: `if (c) {...}`, `if (c) stmt`,
+    Python `if c:` plus its indented block, or for a `catch` the try block it guards. None when pos sits
+    in no branch within COND_LOOKBACK lines."""
+    lo = pos
+    for _ in range(COND_LOOKBACK):
+        lo = code.rfind("\n", 0, max(0, lo))
+        if lo <= 0:
+            lo = 0
+            break
+    for b in reversed(list(BRANCH_RX.finditer(code, lo, pos))):
+        j = b.end()
+        while j < len(code) and code[j] in " \t":
+            j += 1
+        if b.group(0) == "catch":
+            if j < len(code) and code[j] == "(":
+                j = _paren_end(code, j) or j
+            k = code.find("{", j)
+            end = walk.block_end(code, k) if k >= 0 else None
+            if end and k < pos < end:
+                t = code.rfind("try", 0, b.start())
+                return code[t:b.start()] if t >= 0 else ""
+            continue
+        if j < len(code) and code[j] == "(":
+            ce = _paren_end(code, j)
+            if ce is None or ce > pos:
+                continue
+            cond = code[j:ce]
+            k = ce
+            while k < len(code) and code[k] in " \t\n":
+                k += 1
+            if k < len(code) and code[k] == "{":
+                end = walk.block_end(code, k)
+                if end is not None and pos < end:
+                    return cond
+            elif pos < _statement_end(code, k):
+                return cond
+            continue
+        # Python: `if cond:` then a deeper-indented block (or the rest of the line)
+        eol = code.find("\n", j)
+        eol = len(code) if eol < 0 else eol
+        line = code[j:eol]
+        colon = line.rfind(":")
+        if colon < 0:
+            continue
+        if pos < eol:
+            return line[:colon]
+        ls = code.rfind("\n", 0, b.start()) + 1
+        indent = len(code[ls:b.start()]) - len(code[ls:b.start()].lstrip())
+        k = eol + 1
+        while k < len(code):
+            e = code.find("\n", k)
+            e = len(code) if e < 0 else e
+            ln = code[k:e]
+            if ln.strip() and len(ln) - len(ln.lstrip()) <= indent:
+                break
+            if k <= pos < e + 1:
+                return line[:colon]
+            k = e + 1
+    return None
+
+
+def _root_identity(name, chain, called, code, depth):
+    if name in KEYWORDS or name.isdigit():
+        return False
+    segs = [s for s in re.split(r"\s*\??\.\s*", chain.strip()) if s]
+    if name == "env" or (segs[:1] == ["env"]) or (name == "process" and segs[:1] == ["env"]):
+        return bool(segs) and secret_env(segs[-1])  # a shared secret, never a feature flag
+    if name in REQUEST_ROOTS:
+        if segs and segs[0] == "req":  # Hono: c.req.X
+            segs = segs[1:]
+        if any(s.lower() in ("headers", "header") for s in segs):
+            return any(s.lower() in ("authorization", "cookie", "cookies") for s in segs)
+        return bool(segs) and segs[0] in REQUEST_IDENTITY_MEMBERS
+    src = walk.decl_src(name, code)
+    ev = ENV_VALUE_RX.match(src.strip()) if src else None
+    if src and (WHOLE_INPUT_RX.match(src.strip()) or (ev and not secret_env(ev.group(1) or ""))):
+        return False  # the caller's own data, or a feature flag copied into a local
+    if not src and name in CONVENTIONAL_INPUT:
+        return False
+    if IDENTITY_WORD_RX.search(name):
+        return True
+    if called and ACCESS_CALL_RX.search(name):
+        return True
+    if src and depth < 2:
+        if CONTEXT_IDENTITY_RX.search(src):
+            return True
+        for cm in re.finditer(r"([A-Za-z_$][\w$]*)\s*\(", src):
+            if IDENTITY_WORD_RX.search(cm.group(1)) or ACCESS_CALL_RX.search(cm.group(1)):
+                return True
+        return names_identity(src, code, depth + 1)
+    return False
+
+
+def names_identity(cond, code, depth=0):
+    """True when some operand of the condition text is about who the caller is (see the block comment above).
+    `code` is the handler (strings blanked), where the operands' bindings are looked up."""
+    for m in ROOT_RX.finditer(cond):
+        if _root_identity(m.group(1), m.group(2) or "", bool(m.group(3)), code, depth):
+            return True
+    return False
 
 
 def middleware_auth(repo):
@@ -251,10 +541,6 @@ def import_names(repo, rel, text=None):
 # START of a value: `const { model } = body` binds model, `fetch(url, { body: ... })` binds nothing. The
 # connecting-address headers (cf-connecting-ip, x-real-ip, x-forwarded-for) are excluded for every consumer:
 # the edge sets them, the caller does not, so a limiter keyed on them is a real per-client key.
-CALLER_INPUT_RX = re.compile(
-    r"c\.req\.(?:json|parseBody|formData|query|queries|param|text)\(|c\.req\.header\(\s*['\"](?!cf-connecting-ip|x-real-ip|x-forwarded-for)"
-    r"|await\s+(?:req|request|c\.req)\.(?:json|text|formData)\(\)|\breq\.(?:body|query|params)\b|request\.(?:json|formData|text)\(|ctx\.request\.body"
-    r"|\.searchParams\.get\(|\bformData\.get\(|\bevent\.body\b|request\.get_json\(|request\.(?:form|args|json)\b")
 REQUEST_VALUE_NAMES = ("body", "payload", "reqBody", "requestBody")
 # `const input = Schema.parse(await c.req.json())`, `const q = c.req.query('q')`, `const { model } = body`: the
 # whole value is the request's. `const chosen = ALLOWED.includes(body.model) ? ...` is NOT (the server chooses).
@@ -266,8 +552,8 @@ PY_ASSIGN_RX = re.compile(r"^[ \t]*([\w]+)\s*=\s*([^\n]{1,240})", re.M)
 # variable a middleware set from the request, a query/param accessor, the request body under any accessor.
 # Case-insensitive. Never use it to find where input enters a file; `.query(` also matches `db.query(`.
 CALLER_SUPPLIED_RX = re.compile(CALLER_INPUT_RX.pattern +
-                                r"|\.header\(|headers\.get\(|headers\[|req\.body|\bbody\.|payload\.|c\.get\(\s*['\"](?:teacher|user|account)|c\.var\.|searchParams\.get\(|\.query\(|\.param\("
-                                r"|c\.req\.(?:json|parseBody|formData)\(|request\.json\(|req\.json\(|\bbody\b|\bpayload\b", re.I)
+                                r"|\.header\(|headers\.get\(|headers\[|c\.get\(\s*['\"](?:teacher|user|account)|c\.var\.|\.query\(|\.param\("
+                                r"|\bbody\b|\bpayload\b", re.I)  # the accessors themselves come from CALLER_INPUT_RX
 IDENT_RX = re.compile(r"^[A-Za-z_$][\w$]*$")
 
 

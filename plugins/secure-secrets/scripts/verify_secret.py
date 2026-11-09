@@ -64,7 +64,8 @@ def main():
         return 3
     req = urllib.request.Request(base + path, headers=headers(v), method="GET")
     try:
-        code = urllib.request.urlopen(req, timeout=20).status
+        # base is the provider's fixed https host or a http://127.0.0.1 test server (checked above).
+        code = urllib.request.urlopen(req, timeout=20).status  # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
     except urllib.error.HTTPError as e:
         code = e.code
     except (urllib.error.URLError, OSError) as e:

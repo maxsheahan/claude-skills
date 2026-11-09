@@ -10,7 +10,8 @@ pass, and a passing test command never stands in for a scan. A malformed or
 internally inconsistent ledger is exit 2: counts that do not match the
 results, a repo field that is missing or relative (a ledger that does not
 name the absolute checkout it judged is not bound to this one), no git
-binding while R is a git repo, a binding to another commit or working tree,
+binding while R is a git repo, a binding to another commit or working tree (the
+binding is a hash of every non-ignored file's content, see ledger.git_state),
 a generated_at with no time zone or more than five minutes in the future.
 
 --tests-from: a JSON file {"test_command": "npm run test:api"} naming the
@@ -50,7 +51,7 @@ def main():
     ap.add_argument("ledger")
     ap.add_argument("--repo", default=".")
     ap.add_argument("--tests-from")
-    ap.add_argument("--max-age-hours", type=float, default=6.0, help="refuse an older ledger (default 6 h)")
+    ap.add_argument("--max-age-hours", type=float, default=6.0, help="refuse an older ledger (default 6 h); 0 or less never turns the check off")
     a = ap.parse_args()
     try:
         led = json.load(open(a.ledger))
@@ -78,7 +79,10 @@ def main():
         print("GATE ERROR: ledger records no adapter that ran")
         return 2
     g = led.get("git")
-    now = ledger.git_state(a.repo)
+    now = ledger.git_state(a.repo, exclude=[os.path.abspath(a.ledger)])  # the ledger cannot hash itself; the orchestrator leaves it out too
+    if now is not None and not now.get("status"):
+        print("GATE ERROR: cannot hash the working tree of %s (%s), so the ledger cannot be bound to it" % (here, now.get("error", "no tree hash")))
+        return 2
     if g is not None and not isinstance(g, dict):
         print("GATE ERROR: ledger git binding is not an object (%r)" % (g,))
         return 2
@@ -106,7 +110,7 @@ def main():
         print("GATE ERROR: ledger generated_at is %.1f h in the future (more than %d min of clock skew); a timestamp from the future is not usable"
               % (-age.total_seconds() / 3600, FUTURE_SKEW_SECONDS // 60))
         return 2
-    if a.max_age_hours and a.max_age_hours > 0 and age.total_seconds() > a.max_age_hours * 3600:
+    if age.total_seconds() > a.max_age_hours * 3600:  # no value switches the age check off: 0 refuses any ledger older than now
         print("GATE REFUSED: ledger is %.1f h old (limit %.1f h); re-run secure-launch" % (age.total_seconds() / 3600, a.max_age_hours))
         return 1
     try:
@@ -133,7 +137,10 @@ def main():
                                          reason="no test_command declared in %s" % a.tests_from))
         else:
             print("running security tests: %s" % cmd)
-            rc = subprocess.run(cmd, shell=True, cwd=a.repo).returncode
+            # A shell on purpose: test_command is the repo owner's own command line (npm run x && y), read from the
+            # repo's security/gate.json. Whoever can edit that file can already edit the tests it runs, so the shell
+            # adds no new trust boundary. Treat gate.json as code in review.
+            rc = subprocess.run(cmd, shell=True, cwd=a.repo).returncode  # nosemgrep: python.lang.security.audit.subprocess-shell-true.subprocess-shell-true
             if rc == 0:
                 results.append(ledger.result("gate.tests", "Mutation-proven security tests ran", "PASS", "%s exited 0" % cmd))
             else:
